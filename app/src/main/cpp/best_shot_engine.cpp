@@ -30,6 +30,7 @@ BestShotScore BestShotEngine::evaluate(
     float loClipPct
 ) noexcept {
     BestShotScore score{};
+    (void)lumaHistogram;
 
     // 1. Stability Score from gyro history
     if (m_historyCount > 0) {

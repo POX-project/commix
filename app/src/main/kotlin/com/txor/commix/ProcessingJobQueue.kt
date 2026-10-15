@@ -68,6 +68,9 @@ class ProcessingJobQueue private constructor() {
     private val _isPaused = MutableStateFlow(false)
     val isPaused: StateFlow<Boolean> = _isPaused.asStateFlow()
 
+    private val jobExecutionBlocks = java.util.concurrent.ConcurrentHashMap<String, suspend (updateProgress: (Float, String) -> Unit) -> Unit>()
+    private val runningCoroutines = java.util.concurrent.ConcurrentHashMap<String, Job>()
+
     var maxConcurrentJobs: Int = 2
     var autoQueueVideoStabilization: Boolean = true
 
@@ -106,8 +109,12 @@ class ProcessingJobQueue private constructor() {
             priority = priority
         )
 
+        if (executionBlock != null) {
+            jobExecutionBlocks[job.id] = executionBlock
+        }
+
         _jobs.update { listOf(job) + it }
-        triggerNextJobs(executionBlock)
+        triggerNextJobs()
         return job
     }
 
@@ -123,20 +130,32 @@ class ProcessingJobQueue private constructor() {
         _jobs.update { list ->
             list.map { if (it.status == JobStatus.PAUSED) it.copy(status = JobStatus.PENDING) else it }
         }
-        triggerNextJobs(null)
+        triggerNextJobs()
     }
 
     fun clearCompleted() {
         _jobs.update { list -> list.filter { !it.status.isTerminal } }
     }
 
+    fun clearAll() {
+        runningCoroutines.values.forEach { it.cancel() }
+        runningCoroutines.clear()
+        jobExecutionBlocks.clear()
+        _jobs.value = emptyList()
+        maxConcurrentJobs = 2
+        _isPaused.value = false
+    }
+
     fun cancelJob(id: String) {
+        runningCoroutines.remove(id)?.cancel()
+        jobExecutionBlocks.remove(id)
         _jobs.update { list ->
             list.map { if (it.id == id && !it.status.isTerminal) it.copy(status = JobStatus.CANCELLED, currentStage = "Cancelled by user") else it }
         }
+        triggerNextJobs()
     }
 
-    private fun triggerNextJobs(customBlock: (suspend (updateProgress: (Float, String) -> Unit) -> Unit)?) {
+    private fun triggerNextJobs() {
         if (_isPaused.value) return
 
         val currentRunning = activeJobCount
@@ -149,6 +168,7 @@ class ProcessingJobQueue private constructor() {
             .take(availableSlots)
 
         for (target in nextJobs) {
+            val customBlock = jobExecutionBlocks[target.id]
             startJobExecution(target.id, customBlock)
         }
     }
@@ -161,12 +181,12 @@ class ProcessingJobQueue private constructor() {
             list.map { if (it.id == jobId) it.copy(status = JobStatus.RUNNING, currentStage = "Starting pipeline worker...") else it }
         }
 
-        scope.launch {
+        val coroutineJob = scope.launch {
             try {
                 if (customBlock != null) {
                     customBlock { prog, stage ->
                         _jobs.update { list ->
-                            list.map { if (it.id == jobId) it.copy(progress = prog.coerceIn(0f, 1f), currentStage = stage) else it }
+                            list.map { if (it.id == jobId && it.status == JobStatus.RUNNING) it.copy(progress = prog.coerceIn(0f, 1f), currentStage = stage) else it }
                         }
                     }
                 } else {
@@ -179,13 +199,13 @@ class ProcessingJobQueue private constructor() {
                     for ((stageName, targetProgress) in stages) {
                         delay(200)
                         _jobs.update { list ->
-                            list.map { if (it.id == jobId) it.copy(progress = targetProgress, currentStage = stageName) else it }
+                            list.map { if (it.id == jobId && it.status == JobStatus.RUNNING) it.copy(progress = targetProgress, currentStage = stageName) else it }
                         }
                     }
                 }
 
                 _jobs.update { list ->
-                    list.map { if (it.id == jobId) it.copy(status = JobStatus.COMPLETED, progress = 1.0f, currentStage = "Finished") else it }
+                    list.map { if (it.id == jobId && it.status == JobStatus.RUNNING) it.copy(status = JobStatus.COMPLETED, progress = 1.0f, currentStage = "Finished") else it }
                 }
             } catch (e: CancellationException) {
                 _jobs.update { list ->
@@ -196,8 +216,11 @@ class ProcessingJobQueue private constructor() {
                     list.map { if (it.id == jobId) it.copy(status = JobStatus.FAILED, errorMessage = e.message ?: "Processing error", currentStage = "Failed") else it }
                 }
             } finally {
-                triggerNextJobs(null)
+                runningCoroutines.remove(jobId)
+                jobExecutionBlocks.remove(jobId)
+                triggerNextJobs()
             }
         }
+        runningCoroutines[jobId] = coroutineJob
     }
 }

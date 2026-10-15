@@ -64,8 +64,8 @@ class CameraSessionManager {
             CameraState.OPENED -> to == CameraState.CONFIGURING || to == CameraState.CLOSING
             CameraState.CONFIGURING -> to == CameraState.ACTIVE_PREVIEW || to == CameraState.RECORDING_VIDEO || to == CameraState.CLOSING
             CameraState.ACTIVE_PREVIEW -> to == CameraState.CAPTURING_STILL || to == CameraState.RECORDING_VIDEO || to == CameraState.CONFIGURING || to == CameraState.OPENED || to == CameraState.CLOSING
-            CameraState.CAPTURING_STILL -> to == CameraState.ACTIVE_PREVIEW || to == CameraState.CONFIGURING || to == CameraState.CLOSING
-            CameraState.RECORDING_VIDEO -> to == CameraState.ACTIVE_PREVIEW || to == CameraState.CONFIGURING || to == CameraState.CLOSING
+            CameraState.CAPTURING_STILL -> to == CameraState.ACTIVE_PREVIEW || to == CameraState.CONFIGURING || to == CameraState.CLOSING || to == CameraState.CAPTURING_STILL || to == CameraState.RECORDING_VIDEO
+            CameraState.RECORDING_VIDEO -> to == CameraState.ACTIVE_PREVIEW || to == CameraState.CONFIGURING || to == CameraState.CLOSING || to == CameraState.CAPTURING_STILL
             CameraState.CLOSING -> to == CameraState.CLOSED
             CameraState.ERROR -> to == CameraState.CLOSING || to == CameraState.CLOSED
         }

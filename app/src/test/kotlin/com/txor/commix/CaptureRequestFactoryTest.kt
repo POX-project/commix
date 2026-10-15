@@ -1,31 +1,15 @@
 package com.txor.commix
 
+import android.graphics.Rect
+import kotlin.math.roundToInt
 import org.junit.Assert.*
 import org.junit.Test
-import kotlin.math.roundToInt
 
 class CaptureRequestFactoryTest {
 
-    data class CropRect(val left: Int, val top: Int, val right: Int, val bottom: Int) {
-        val width: Int get() = right - left
-        val height: Int get() = bottom - top
-    }
-
-    private fun computeCrop(active: CropRect, zoom: Double): CropRect {
-        val z = zoom.coerceAtLeast(1.0)
-        val activeW = active.width
-        val activeH = active.height
-        val cropW = (activeW / z).toInt()
-        val cropH = (activeH / z).toInt()
-        val cropX = active.left + (activeW - cropW) / 2
-        val cropY = active.top + (activeH - cropH) / 2
-        return CropRect(cropX, cropY, cropX + cropW, cropY + cropH)
-    }
-
     @Test
     fun testZoomCalculationRestoresFullSensorAtOneX() {
-        val sensorActiveArray = CropRect(0, 0, 4000, 3000)
-        val crop = computeCrop(sensorActiveArray, 1.0)
+        val crop = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, 1.0)
 
         assertEquals(0, crop.left)
         assertEquals(0, crop.top)
@@ -37,8 +21,7 @@ class CaptureRequestFactoryTest {
 
     @Test
     fun testZoomCalculationCentersCroppedRegionAtTwoX() {
-        val sensorActiveArray = CropRect(0, 0, 4000, 3000)
-        val crop = computeCrop(sensorActiveArray, 2.0)
+        val crop = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, 2.0)
 
         assertEquals(2000, crop.width)
         assertEquals(1500, crop.height)
@@ -50,8 +33,7 @@ class CaptureRequestFactoryTest {
 
     @Test
     fun testSubOneZoomIsSafelyCoercedToOneX() {
-        val sensorActiveArray = CropRect(0, 0, 4000, 3000)
-        val crop = computeCrop(sensorActiveArray, 0.5)
+        val crop = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, 0.5)
 
         assertEquals(0, crop.left)
         assertEquals(0, crop.top)
@@ -62,15 +44,28 @@ class CaptureRequestFactoryTest {
     }
 
     @Test
-    fun testEvIndexCalculation() {
-        val evStep = 0.1f
-        val evStops = 1.0f
-        val index = (evStops / evStep).roundToInt()
-        assertEquals(10, index)
+    fun testDegenerateSensorActiveBoundsDoNotCrash() {
+        val zeroCrop = CaptureRequestFactory.calculateCrop(0, 0, 0, 0, 2.0)
+        assertEquals(0, zeroCrop.width)
+        assertEquals(0, zeroCrop.height)
 
-        val negEvStops = -1.5f
-        val negIndex = (negEvStops / evStep).roundToInt()
-        assertEquals(-15, negIndex)
+        val smallCrop = CaptureRequestFactory.calculateCrop(0, 0, 32, 24, 2.0)
+        assertEquals(32, smallCrop.width)
+        assertEquals(24, smallCrop.height)
+    }
+
+    @Test
+    fun testKelvinToRggbProducesValidGains() {
+        val gains6500 = CaptureRequestFactory.calculateRgbGains(6500)
+        assertEquals(4, gains6500.size)
+        assertEquals(1.0f, gains6500[1], 0.001f) // G_even
+        assertEquals(1.0f, gains6500[2], 0.001f) // G_odd
+        assertTrue(gains6500[0] in 1.0f..3.5f)   // R
+        assertTrue(gains6500[3] in 1.0f..3.5f)   // B
+
+        // Low kelvin (warm) should require higher blue gain and lower red gain to balance
+        val warmGains = CaptureRequestFactory.calculateRgbGains(2500)
+        assertTrue(warmGains[3] > gains6500[3])
     }
 
     @Test
@@ -90,7 +85,6 @@ class CaptureRequestFactoryTest {
 
     @Test
     fun testSpaceZoomHardwareClampingPreventsHalRejection() {
-        val sensorActiveArray = CropRect(0, 0, 4000, 3000)
         val hardwareMaxZoom = 10.0
 
         // User requests 30.0x Space Zoom (Super-resolution mode)
@@ -98,7 +92,7 @@ class CaptureRequestFactoryTest {
         val effectiveHwZoom30 = requestedZoom30.coerceAtMost(hardwareMaxZoom)
         assertEquals(10.0, effectiveHwZoom30, 0.001)
 
-        val crop30 = computeCrop(sensorActiveArray, effectiveHwZoom30)
+        val crop30 = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, effectiveHwZoom30)
         assertEquals(400, crop30.width)
         assertEquals(300, crop30.height)
 
@@ -107,14 +101,14 @@ class CaptureRequestFactoryTest {
         val effectiveHwZoom100 = requestedZoom100.coerceAtMost(hardwareMaxZoom)
         assertEquals(10.0, effectiveHwZoom100, 0.001)
 
-        val crop100 = computeCrop(sensorActiveArray, effectiveHwZoom100)
+        val crop100 = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, effectiveHwZoom100)
         assertEquals(400, crop100.width)
         assertEquals(300, crop100.height)
 
         // For standard 2.0x zoom, hardware zoom is not clamped
         val effectiveHwZoom2 = 2.0.coerceAtMost(hardwareMaxZoom)
         assertEquals(2.0, effectiveHwZoom2, 0.001)
-        val crop2 = computeCrop(sensorActiveArray, effectiveHwZoom2)
+        val crop2 = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, effectiveHwZoom2)
         assertEquals(2000, crop2.width)
         assertEquals(1500, crop2.height)
     }

@@ -12,8 +12,7 @@ class ProcessingJobQueueTest {
 
     @Before
     fun setUp() {
-        queue.clearCompleted()
-        queue.resumeAll()
+        queue.clearAll()
     }
 
     @Test
@@ -98,5 +97,102 @@ class ProcessingJobQueueTest {
         queue.clearCompleted()
         val exists = queue.jobs.value.any { it.id == job.id }
         assertFalse(exists)
+    }
+
+    @Test
+    fun testQueuedJobRetainsItsCustomExecutionBlockAcrossSlotTransitions() = runBlocking {
+        queue.maxConcurrentJobs = 1
+        var job1Ran = false
+        var job2Ran = false
+
+        val job1 = queue.enqueueJob(
+            title = "Blocking Slot Job 1",
+            type = ProcessingJobType.MULTI_EXPOSURE_STACK
+        ) { updateProgress ->
+            job1Ran = true
+            updateProgress(0.5f, "Working")
+            delay(100)
+            updateProgress(1.0f, "Done")
+        }
+
+        val job2 = queue.enqueueJob(
+            title = "Queued Job 2",
+            type = ProcessingJobType.RAW_DEVELOPMENT
+        ) { updateProgress ->
+            job2Ran = true
+            updateProgress(1.0f, "Custom Finished")
+        }
+
+        // Initially job1 is running and job2 is pending
+        delay(20)
+        val j2Pending = queue.jobs.value.find { it.id == job2.id }
+        assertEquals(JobStatus.PENDING, j2Pending?.status)
+
+        // Wait for job1 to complete and trigger job2
+        delay(350)
+        assertTrue("Job 1 custom block must have executed", job1Ran)
+        assertTrue("Job 2 custom block must have executed once slot freed", job2Ran)
+
+        val j2Done = queue.jobs.value.find { it.id == job2.id }
+        assertEquals(JobStatus.COMPLETED, j2Done?.status)
+        assertEquals("Finished", j2Done?.currentStage)
+    }
+
+    @Test
+    fun testConcurrentJobsExecuteDistinctPayloads() = runBlocking {
+        queue.maxConcurrentJobs = 2
+        val executionLog = java.util.concurrent.CopyOnWriteArrayList<String>()
+
+        val jobA = queue.enqueueJob(
+            title = "Job Alpha",
+            type = ProcessingJobType.VIDEO_STABILIZATION
+        ) { _ ->
+            executionLog.add("AlphaStarted")
+            delay(50)
+            executionLog.add("AlphaFinished")
+        }
+
+        val jobB = queue.enqueueJob(
+            title = "Job Beta",
+            type = ProcessingJobType.SLOW_MO_INTERPOLATION
+        ) { _ ->
+            executionLog.add("BetaStarted")
+            delay(50)
+            executionLog.add("BetaFinished")
+        }
+
+        delay(250)
+        assertTrue(executionLog.contains("AlphaStarted"))
+        assertTrue(executionLog.contains("AlphaFinished"))
+        assertTrue(executionLog.contains("BetaStarted"))
+        assertTrue(executionLog.contains("BetaFinished"))
+    }
+
+    @Test
+    fun testCancelJobActuallyCancelsRunningCoroutineAndStaysCancelled() = runBlocking {
+        var continuedAfterCancel = false
+
+        val job = queue.enqueueJob(
+            title = "Long Running Job To Cancel",
+            type = ProcessingJobType.PANORAMA_STITCHING
+        ) { _ ->
+            delay(100)
+            continuedAfterCancel = true
+        }
+
+        delay(30)
+        val runningJob = queue.jobs.value.find { it.id == job.id }
+        assertEquals(JobStatus.RUNNING, runningJob?.status)
+
+        // Cancel while running
+        queue.cancelJob(job.id)
+        val cancelledJob = queue.jobs.value.find { it.id == job.id }
+        assertEquals(JobStatus.CANCELLED, cancelledJob?.status)
+
+        // Wait beyond the job duration
+        delay(200)
+        assertFalse("Coroutine must be cancelled and not continue past delay", continuedAfterCancel)
+        val finalJob = queue.jobs.value.find { it.id == job.id }
+        assertEquals(JobStatus.CANCELLED, finalJob?.status)
     }
 }

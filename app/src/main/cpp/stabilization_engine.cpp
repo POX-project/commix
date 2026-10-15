@@ -36,6 +36,7 @@ bool StabilizationEngine::stopAndExportGyroflow(
     const char* cameraName,
     double frameRate
 ) noexcept {
+    if (!outputPath || !outputPath[0]) return false;
     m_isLogging.store(false, std::memory_order_release);
     size_t endIndex = m_writeIndex.load(std::memory_order_relaxed);
 

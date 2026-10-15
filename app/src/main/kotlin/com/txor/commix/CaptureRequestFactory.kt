@@ -42,6 +42,37 @@ data class CaptureRequestParams(
  */
 object CaptureRequestFactory {
 
+    data class CropBounds(val left: Int, val top: Int, val right: Int, val bottom: Int) {
+        val width: Int get() = right - left
+        val height: Int get() = bottom - top
+    }
+
+    /**
+     * Calculates digital crop bounds based on sensor active coordinates and zoom factor.
+     */
+    fun calculateCrop(activeLeft: Int, activeTop: Int, activeRight: Int, activeBottom: Int, zoom: Double): CropBounds {
+        val activeW = activeRight - activeLeft
+        val activeH = activeBottom - activeTop
+        if (activeW <= 0 || activeH <= 0) return CropBounds(activeLeft, activeTop, activeRight, activeBottom)
+
+        val z = zoom.coerceAtLeast(1.0)
+        val minW = 64.coerceAtMost(activeW)
+        val minH = 48.coerceAtMost(activeH)
+        val cropW = (activeW / z).toInt().coerceIn(minW, activeW)
+        val cropH = (activeH / z).toInt().coerceIn(minH, activeH)
+        val cropX = activeLeft + (activeW - cropW) / 2
+        val cropY = activeTop + (activeH - cropH) / 2
+        return CropBounds(cropX, cropY, cropX + cropW, cropY + cropH)
+    }
+
+    /**
+     * Calculates the centered digital crop rectangle for digital zoom.
+     */
+    fun calculateCropRegion(active: Rect, zoom: Double): Rect {
+        val b = calculateCrop(active.left, active.top, active.right, active.bottom, zoom)
+        return Rect(b.left, b.top, b.right, b.bottom)
+    }
+
     /**
      * Applies all exposure, optical, stabilization, flash, and 3A controls to the target CaptureRequest.Builder.
      */
@@ -126,26 +157,12 @@ object CaptureRequestFactory {
                 // If user zoomed beyond the hardware zoom range, apply digital crop via SCALER_CROP_REGION
                 val remainderZoom = params.zoom / z.toDouble()
                 if (remainderZoom > 1.01 && params.activeRect != null) {
-                    val active = params.activeRect
-                    val activeW = active.right - active.left
-                    val activeH = active.bottom - active.top
-                    val cropW = (activeW / remainderZoom).toInt().coerceIn(64, activeW)
-                    val cropH = (activeH / remainderZoom).toInt().coerceIn(48, activeH)
-                    val cropX = active.left + (activeW - cropW) / 2
-                    val cropY = active.top + (activeH - cropH) / 2
-                    builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(cropX, cropY, cropX + cropW, cropY + cropH))
+                    val cropRect = calculateCropRegion(params.activeRect, remainderZoom)
+                    builder.set(CaptureRequest.SCALER_CROP_REGION, cropRect)
                 }
             } else if (params.activeRect != null) {
-                // Digital crop across the entire zoom range (up to 30x / 100x Space Zoom)
-                val active = params.activeRect
-                val z = params.zoom.coerceAtLeast(1.0)
-                val activeW = active.right - active.left
-                val activeH = active.bottom - active.top
-                val cropW = (activeW / z).toInt().coerceIn(64, activeW)
-                val cropH = (activeH / z).toInt().coerceIn(48, activeH)
-                val cropX = active.left + (activeW - cropW) / 2
-                val cropY = active.top + (activeH - cropH) / 2
-                builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(cropX, cropY, cropX + cropW, cropY + cropH))
+                val cropRect = calculateCropRegion(params.activeRect, params.zoom)
+                builder.set(CaptureRequest.SCALER_CROP_REGION, cropRect)
             }
         } catch (_: Throwable) {}
 
@@ -179,7 +196,7 @@ object CaptureRequestFactory {
     /**
      * Approximates RGGB channel gains from a Kelvin temperature using standard Planckian locus approximation.
      */
-    private fun calculateRgbGains(kelvin: Int): FloatArray {
+    internal fun calculateRgbGains(kelvin: Int): FloatArray {
         val temp = kelvin.coerceIn(2000, 10000) / 100.0
         val r: Double
         val b: Double

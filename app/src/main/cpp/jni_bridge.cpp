@@ -69,7 +69,7 @@ static void JNICALL native_compute_scopes_direct(
     jobject y_buf, jobject u_buf, jobject v_buf,
     jint width, jint height, jint y_stride, jint uv_stride, jint uv_pixel_stride, jint step
 ) {
-    if (!y_buf || !u_buf || !v_buf || width <= 0 || height <= 0) return;
+    if (!y_buf || !u_buf || !v_buf || width < 2 || height < 2 || y_stride < width || uv_stride < (width / 2) || uv_pixel_stride < 1) return;
 
     size_t reqY = static_cast<size_t>(height - 1) * y_stride + width;
     size_t reqUV = static_cast<size_t>((height / 2) - 1) * uv_stride + ((width / 2) - 1) * uv_pixel_stride + 1;

@@ -632,11 +632,11 @@ class CommixRepository(private val context: Context) {
                 it == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
             } == true
         )
+        val oldMode = currentParams.activeMode
+        val oldVideoRes = currentParams.videoResolution
         currentParams = enriched
         applyCaptureParams()
 
-        val oldMode = currentParams.activeMode
-        val oldVideoRes = currentParams.videoResolution
         val needsReconfig = (oldMp != enriched.targetPhotoMp || oldMode != enriched.activeMode || oldVideoRes != enriched.videoResolution) && !isRecordingVideo
 
         if (needsReconfig) {
@@ -1075,14 +1075,15 @@ class CommixRepository(private val context: Context) {
         isNightBurstActive = true
         synchronized(nightBurstCollector) { nightBurstCollector.clear() }
 
+        val sensorOrientation = activeCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val burstCount = 6
         val burstRequests = mutableListOf<CaptureRequest>()
         for (i in 0 until burstCount) {
             val req = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
                 CaptureRequestFactory.applyControls(this, currentParams)
-                set(CaptureRequest.JPEG_QUALITY, 95.toByte())
-                set(CaptureRequest.JPEG_ORIENTATION, 90)
+                set(CaptureRequest.JPEG_QUALITY, metadata.compressionQuality.toByte())
+                set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
             }
             burstRequests.add(req.build())
         }

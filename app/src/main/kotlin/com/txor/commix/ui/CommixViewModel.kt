@@ -321,7 +321,8 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
                             val meta = createShotMetadata(_uiState.value)
                             repository.takePicture(meta)
                             _uiState.update { it.copy(timeLapseFrames = it.timeLapseFrames + 1) }
-                            delay(2000)
+                            val intervalMs = (_uiState.value.timeLapseIntervalSec.toDouble() * 1000.0).toLong().coerceAtLeast(500L)
+                            delay(intervalMs)
                         }
                     }
                 }

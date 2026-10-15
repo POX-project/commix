@@ -308,7 +308,7 @@ float ComputationalPhotoEngine::calculateHyperfocalDistance(
     float fNumber,
     float circleOfConfusionMm
 ) noexcept {
-    if (fNumber <= 0.0f || circleOfConfusionMm <= 0.0f) return 0.0f;
+    if (focalLengthMm <= 0.0f || fNumber <= 0.0f || circleOfConfusionMm <= 0.0f) return 0.0f;
     float fMeters = focalLengthMm * 0.001f;
     float cMeters = circleOfConfusionMm * 0.001f;
     return (fMeters * fMeters) / (fNumber * cMeters) + fMeters;

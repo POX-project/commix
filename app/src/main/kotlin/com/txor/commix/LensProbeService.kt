@@ -112,23 +112,16 @@ object LensProbeService {
         knownIds: Set<String>,
         onDiscovered: (CameraProbeResult) -> Unit
     ) {
-        val threadCount = Runtime.getRuntime().availableProcessors().coerceIn(4, 32)
-        val executor = java.util.concurrent.Executors.newFixedThreadPool(threadCount)
-        val tasks = mutableListOf<java.util.concurrent.Callable<Unit>>()
-        val chunkSize = 500
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(4)
+        val candidateIds = ((0..128).map { it.toString() } + listOf("20", "21", "22", "40", "41", "50", "51", "60", "61")).distinct()
 
-        for (start in -10000..10000 step chunkSize) {
-            val end = (start + chunkSize - 1).coerceAtMost(10000)
-            tasks.add(java.util.concurrent.Callable {
-                for (i in start..end) {
-                    val idStr = i.toString()
-                    if (knownIds.contains(idStr)) continue
-                    try {
-                        manager.getCameraCharacteristics(idStr)
-                        buildCameraProbeResult(manager, idStr)?.let { onDiscovered(it) }
-                    } catch (_: Exception) {}
-                }
-            })
+        val tasks = candidateIds.filter { !knownIds.contains(it) }.map { idStr ->
+            java.util.concurrent.Callable<Unit> {
+                try {
+                    manager.getCameraCharacteristics(idStr)
+                    buildCameraProbeResult(manager, idStr)?.let { onDiscovered(it) }
+                } catch (_: Exception) {}
+            }
         }
 
         Thread {
@@ -138,7 +131,11 @@ object LensProbeService {
             } finally {
                 executor.shutdown()
             }
-        }.start()
+        }.apply {
+            name = "Commix-Lens-Probe-Worker"
+            isDaemon = true
+            start()
+        }
     }
 
     fun buildCameraProbeResult(manager: CameraManager, id: String): CameraProbeResult? {

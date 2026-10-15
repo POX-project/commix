@@ -18,6 +18,7 @@ void commix_telemetry_write_begin(void) {
     g_telemetry_mutex.lock();
     uint32_t seq = g_sequence_counter.load(std::memory_order_relaxed);
     tl_write_seq = (seq << 1) | 1u; // Guaranteed odd: write in progress
+    g_telemetry_buffer.seq_end = tl_write_seq;
     g_telemetry_buffer.seq_begin = tl_write_seq;
     std::atomic_thread_fence(std::memory_order_release);
 }

@@ -108,9 +108,40 @@ class CameraSessionManagerTest {
         assertFalse(sessionManager.transitionTo(CameraState.ACTIVE_PREVIEW))
         assertEquals(CameraState.OPENING, sessionManager.state)
 
-        // RECORDING_VIDEO -> CAPTURING_STILL is illegal
-        sessionManager.forceState(CameraState.RECORDING_VIDEO)
+        // OPENED -> CAPTURING_STILL is illegal (must configure first)
+        sessionManager.forceState(CameraState.OPENED)
         assertFalse(sessionManager.transitionTo(CameraState.CAPTURING_STILL))
+        assertEquals(CameraState.OPENED, sessionManager.state)
+    }
+
+    @Test
+    fun testBurstShootingTransitionsAllowed() {
+        sessionManager.forceState(CameraState.ACTIVE_PREVIEW)
+        assertTrue(sessionManager.transitionTo(CameraState.CAPTURING_STILL))
+        assertEquals(CameraState.CAPTURING_STILL, sessionManager.state)
+
+        // Burst shot 2, 3, 4 without returning to ACTIVE_PREVIEW
+        assertTrue(sessionManager.transitionTo(CameraState.CAPTURING_STILL))
+        assertTrue(sessionManager.transitionTo(CameraState.CAPTURING_STILL))
+        assertEquals(CameraState.CAPTURING_STILL, sessionManager.state)
+
+        // Finish burst sequence
+        assertTrue(sessionManager.transitionTo(CameraState.ACTIVE_PREVIEW))
+        assertEquals(CameraState.ACTIVE_PREVIEW, sessionManager.state)
+    }
+
+    @Test
+    fun testVideoSnapshotTransitionsAllowed() {
+        sessionManager.forceState(CameraState.ACTIVE_PREVIEW)
+        assertTrue(sessionManager.transitionTo(CameraState.RECORDING_VIDEO))
+        assertEquals(CameraState.RECORDING_VIDEO, sessionManager.state)
+
+        // Snapshot photo capture while actively recording
+        assertTrue(sessionManager.transitionTo(CameraState.CAPTURING_STILL))
+        assertEquals(CameraState.CAPTURING_STILL, sessionManager.state)
+
+        // Return back to recording video
+        assertTrue(sessionManager.transitionTo(CameraState.RECORDING_VIDEO))
         assertEquals(CameraState.RECORDING_VIDEO, sessionManager.state)
     }
 
