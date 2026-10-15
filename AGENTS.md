@@ -29,12 +29,12 @@ If you cannot produce all four, the checkbox stays `[ ]`. "It compiles" is not e
 - **Unimplemented claims in prose** — no "lock-free", "NEON", "SIMD", "@FastNative", "120Hz", "crash-resilient", "HAL3 direct", "1kHz" anywhere unless the code and a produced artifact prove it. As of this audit, none of those claims survive; see `AUDIT.md` §§A1–A12.
 - **Broken artifacts with confident names** — `Fmp4Muxer` writes files no player can open, behind a "crash-resilient fMP4" label. A fallback that cannot be played is worse than an honest failure.
 
-## 3. What is actually true (verified 2026-10-15, this machine)
+## 3. What is actually true (verified 2026-10-15/16, this machine)
 
-- **Gradle 8.14 + AGP 8.7.3: the project builds.** `BUILD SUCCESSFUL`; `:app:testReleaseUnitTest` green (82/82); the APK contains `lib/arm64-v8a/libcommix_native.so`; the release APK is **signed with the Android Debug key** and is not a shipping artifact.
-- **The pinned wrapper (Gradle 9.3.1) is an unsupported pairing for AGP 8.7.3** — Gradle itself flags the build *"incompatible with Gradle 9.0"*. Do not claim `./gradlew ...` works until you have actually run it and pasted the output.
-- The C++ compiles and links. It just does the wrong things at runtime (`AUDIT.md` §§A–C).
-- The 82 passing unit tests do **not** cover any of the defects — they test copies of the logic. Green here means nothing (AUDIT.md §E).
+- **A clean checkout of `a61ed9c` does NOT build** — `AAPT: resource mipmap/ic_launcher not found` (the manifest references launcher icons that were never committed). The icons arrived untracked and are **committed in `7ac0795`** — build claims apply only from `7ac0795` onward. Never re-check "assembleRelease verified" for `a61ed9c`.
+- **`7ac0795` builds.** Debug JVM tests are green: **83/83** (`app/build/test-results/`); the wrapper-pinned Gradle 9.3.1 has run the build via `./gradlew` — the old "incompatible with Gradle 9.0" notice did not stop it. An earlier release build of this tree (Gradle 8.14) produced an APK containing `lib/arm64-v8a/libcommix_native.so`, **signed with the Android Debug key** — not a shipping artifact. Trust pasted output, not warnings.
+- The C++ compiles and links, and `app/src/test/cpp/native_engine_test.cpp` passes (manual `g++`; **not wired into CMake/Gradle** — it detects nothing automatically yet).
+- 83 green JVM tests do **not** mean the features work: §§C3–C8, §D (settings theater) and §A2 (seqlock atomics) remain open (`AUDIT.md` §I).
 
 ## 4. Required fix order (details and file:line in `AUDIT.md` §G)
 

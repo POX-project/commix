@@ -256,7 +256,7 @@ This is why the checklist could be marked complete without the features working:
 
 **The commit does not build from a clean checkout — verified.** Built exactly `a61ed9c` in a pristine `git worktree` with Gradle 8.14 + AGP 8.7.3:
 
-- `:app:processReleaseResources` **FAILS**: `AAPT: error: resource mipmap/ic_launcher (aka org.codeaurora.snapcam:mipmap/ic_launcher) not found`. `AndroidManifest.xml:42` references `@mipmap/ic_launcher`, but the commit's tracked `app/src/main/res/` contains only `drawable/launch_background.xml` and `values/styles.xml` — **no launcher icon resources exist in the commit**. They exist only as *untracked* files added 2026-10-15 22:26 (34 minutes after the commit). Therefore `TODO.md:144`'s "`assembleRelease` verified" was never true of this commit.
+- `:app:processReleaseResources` **FAILS**: `AAPT: error: resource mipmap/ic_launcher (aka org.codeaurora.snapcam:mipmap/ic_launcher) not found`. `AndroidManifest.xml:42` references `@mipmap/ic_launcher`, but the commit's tracked `app/src/main/res/` contains only `drawable/launch_background.xml` and `values/styles.xml` — **no launcher icon resources exist in the commit**. They were added untracked 2026-10-15 22:26 (34 minutes after the commit) and are **committed in `7ac0795`**. Therefore `TODO.md:144`'s "`assembleRelease` verified" was never true of this commit.
 - With those untracked icon files present (the current working tree), the build is green: Gradle 8.14 → `:app:testReleaseUnitTest :app:assembleRelease` **BUILD SUCCESSFUL** (18m07s), **82/82 unit tests**, `app-release.apk` (4.6 MB) containing `lib/arm64-v8a/libcommix_native.so` — **signed with the Android Debug key** (`apksigner`: `CN=Android Debug`), so it is not a shipping artifact.
 - Gradle 9 line: a control build on Gradle 9.1.0 (the pinned wrapper is 9.3.1; 9.1.0 was the nearest available on this machine) configured, compiled Kotlin/C++ and ran R8 with only Gradle's generic deprecation notice ("incompatible with Gradle 9.0"), reaching test execution before a concurrent build in the same working tree stalled it. So the earlier claim in this section that the AGP/Gradle-9 pairing is "a failure waiting to happen" was wrong — the real, proven failure is the missing resources on a clean checkout.
 - First `./gradlew` on a new machine must download a ~230 MB Gradle distribution; on this network it crawled (~10–120 KB/s) and the user's own cache holds only a never-completed `.part` for 9.3.1. Environmental — but it is why "just run `./gradlew`" is not verification.
@@ -296,27 +296,35 @@ Claims that fail (3) — like "120Hz zero-jank", "assembleRelease verified" — 
 
 ---
 
-## I. Remediation watch — working-tree batch of 2026-10-15 22:26
+## I. Remediation watch — batches of 2026-10-15/16
 
-Shortly after this audit, a second batch of edits landed in the working tree (all files stamped 22:26:15 — one programmatic batch). Snapshot of alignment as of that batch:
+### Batch 1 — working-tree edits, 22:26
 
-**Addressed (or partially):**
-- Dead twins deleted: `commix_native.cpp`, `commix_scopes.cpp/.h`, `ImagePipeline.kt`, `VulkanComputeEngine.kt` (§B3/B4). ✔
-- Missing launcher resources (`drawable/ic_launcher*.xml`, `mipmap/`, `mipmap-anydpi-v26/`) added as **untracked** files — this repairs the pristine-checkout AAPT failure (§F), but they must be committed before the fix exists in the repository.
-- `ProcessingJobQueue`: execution blocks are now stored and actually run, `cancelJob` cancels the coroutine, `clearAll()` added, progress updates are guarded by RUNNING status (§C10 — partly).
-- Seqlock: `commix_telemetry_write_begin()` now stamps `seq_end = odd` at write start, which closes the common torn-read interleaving demonstrated in §A2(b). ✱ But: the fields and counters are still plain non-atomics (still formally UB), there is still no reader retry loop, and the writer mutex remains — "lock-free" is still false (§A2a/c).
-- Small guards: `native_compute_scopes_direct` stride/validation hardening; `stopAndExportGyroflow` null-path check; `calculateHyperfocalDistance` non-positive-focal guard.
-- New `app/src/test/cpp/native_engine_test.cpp` with a `main()` that exercises real classes (hyperfocal, astro median, etc.) — the right idea (§G.9).
+All files stamped 22:26:15 (one programmatic batch):
 
-**Still outstanding at that snapshot:**
-- `native_engine_test.cpp` is wired into **no build** — no CMake target, no Gradle task. It cannot run, so per `AGENTS.md` §1 it is not evidence yet.
-- The three `ProcessingJobQueue.enqueueJob` call sites still pass **no** execution block (`CommixRepository.kt:955, 1303, 1367`) — the fake progress bars remain.
-- `best_shot_engine.cpp` changed only to silence an unused-parameter warning (`(void)lumaHistogram;`). `nativePushBestShotVelocity` still has no caller, so "SHOOT NOW" still can never fire (§C4).
-- IMU/Gyroflow data path (§A4), silent video (§C5), synthetic PTS (§C5), `Fmp4Muxer` (§C6), time-lapse interval (§C9), night-burst orientation (§C8), preview rotation (§A9), `updateParams` ordering (§C2), and the entire settings theater (§D) — all untouched.
-- Release signing still debug; `applicationId` still impersonates `org.codeaurora.snapcam` (§A10).
-- Note: the batch landed mid-build and contaminated the first test run — see the timing caveat in §F.
+- Dead twins deleted: `commix_native.cpp`, `commix_scopes.cpp/.h`, `ImagePipeline.kt`, `VulkanComputeEngine.kt` (§B3/B4).
+- Missing launcher resources added — they repair the pristine-checkout AAPT failure (§F). **Committed in `7ac0795`.**
+- `ProcessingJobQueue`: execution blocks stored and run; `cancelJob` cancels; `clearAll()` added; progress guarded by RUNNING status (§C10 — partly).
+- Seqlock: `write_begin()` now stamps `seq_end = odd`, closing the common torn-read interleaving (§A2b). Counters remain plain non-atomics, no reader retry loop, writer mutex remains — "lock-free" is still false.
+- Guards: scopes-JNI validation, Gyroflow null path, hyperfocal non-positive focal.
 
-**Verdict on the batch:** correct first steps, concentrated on the cheap structural items (dead code, queue internals, guards). The runtime-false features — the ones a user would actually notice — are untouched. This audit stands until §C2–§C10 and §D are genuinely resolved, each with the artifacts required by §H.
+### Batch 2 — commit `7ac0795` (the author's response to this audit)
+
+Independently checked by the auditor on 2026-10-16:
+
+- Working tree clean; dead files gone; launcher icons tracked.
+- **JVM tests: 83/83, 0 failures** (`app/build/test-results/testDebugUnitTest/*.xml`, 8 classes). `CaptureRequestFactoryTest` now calls production `calculateCrop` — and it caught a real crash: degenerate crop bounds hit `Cannot coerce value to an empty range`; the fix adds `CropBounds` with `activeW <= 0`/`activeH <= 0` guards and `64.coerceAtMost(activeW)` minimums (`CaptureRequestFactory.kt:45-72`).
+- **Native suite recompiled and rerun by the auditor** (`g++ -std=c++20 -Wall -Wextra -Werror`, all engine sources): all 7 suites pass — hyperfocal math, astro median, long-exposure alpha/max, multi-exposure modes, scopes neutral IRE + bounds, Gyroflow export (header only), seqlock odd/even contract.
+- Code spot-checks: `updateParams` captures old mode/resolution before assignment (`CommixRepository.kt:635-640, 662`); time-lapse reads `timeLapseIntervalSec` with a 500 ms floor (`CommixViewModel.kt:324-325`); lens probing is `cameraIdList`-based plus a bounded 0..128 background scan (`LensProbeService.kt:57-139`); burst + video-snapshot state transitions allowed (`CameraSessionManager.kt:67-68`); `.kotlin/` ignored.
+
+**Residuals after `7ac0795`:**
+
+- `native_engine_test.cpp` is wired into no CMake/Gradle task — it cannot run automatically. It also asserts only the Gyroflow header line (row values can still be all-zero per §A4/C3 and the test stays green) and has no multi-threaded telemetry test (§G.1).
+- The LensProbe fix left stale copy referring to the old scan range: comment `LensProbeService.kt:106-108`, status text `CommixViewModel.kt:528`, button label `HardwareLensModal.kt:139` still say "−10000..10000".
+- Production `enqueueJob` call sites still pass no execution block (`CommixRepository.kt:955, 1303, 1367`) — progress bars remain simulated.
+- "SHOOT NOW" still cannot fire (no `pushVelocity` caller); IMU/Gyroflow path (§A4) still writes zeros; video still has no audio track and synthetic PTS (§C5); `Fmp4Muxer` still unplayable (§C6); `stopVideoRecording()` still on the main thread (§C7); night-burst orientation still hardcoded (§C8); preview rotation unhandled (§A9); the entire settings theater (§D) untouched; release still debug-signed; `applicationId` still impersonates `org.codeaurora.snapcam`.
+
+**Verdict:** Batch 2 is real engineering — the first code in this repo whose tests call production paths, including one that caught a genuine crash. But it fixes the cheap structural items; what a user would notice (audio in videos, Gyroflow data usable in Gyroflow, best shot, settings) is still broken, and the new native suite cannot run in any build. §A6, §C2, §C9 and the worst of §C10 are genuinely resolved; §§C3–C8, §D and §A2 (atomics) are not.
 
 ---
 

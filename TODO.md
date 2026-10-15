@@ -88,7 +88,7 @@
   - [x] Thread-safe atomic state machine (`AtomicReference<CameraState>`).
   - [x] Multi-surface routing: live preview, YUV analysis reader, still capture, and video encoder surfaces.
 - [x] Refactor `LensProbeService`:
-  - [ ] Sensor probing from ID 0 to 128 for auxiliary lenses (Zero Hardcoding). — **FALSIFIED:** the service spams `getCameraCharacteristics()` over IDs −10000..10000 (20,001 attempts, most throwing) on 32 threads — a battery/CPU burner that contradicts its own documented range (§A6).
+  - [ ] Sensor probing from ID 0 to 128 for auxiliary lenses (Zero Hardcoding). — **FALSIFIED as committed in `a61ed9c`:** the service spammed IDs −10000..10000 on 32 threads (§A6). **FIXED in `7ac0795`**: `cameraIdList` probing + bounded 0..128 background scan (`LensProbeService.kt:57-139`). Residual stale copy still says "−10000..10000" (`LensProbeService.kt:106-108` comment, `CommixViewModel.kt:528`, `HardwareLensModal.kt:139`). No test yet.
   - [x] Dynamic lens characteristics, focal lengths, aperture limits, and 35mm equivalents.
 - [x] Refactor `CaptureRequestFactory`:
   - [x] Manual ISO, exposure nanoseconds, Kelvin gains, manual focus diopters, zoom ratio, and OIS/EIS controls.
@@ -113,11 +113,11 @@
   - [x] Studio video recording start/stop with SMPTE timecode and Gyroflow `.gcsv` export. — *the `.gcsv` export currently produces an all-zero file (§A4/C3); `stopVideoRecording()` also runs on the UI thread (§C7).*
   - [x] Night Mode multi-exposure burst capture (6 frames) with C++20 median noise stacking. — *hardcodes `JPEG_ORIENTATION=90` instead of the sensor orientation, and hardcodes 6 frames while the `nightFrameCount` setting is ignored (§C8).*
   - [x] Process Zero tone curves and multi-threaded analog silver halide grain synthesis.
-  - [ ] Time-lapse intervalometer ticker. — **FALSIFIED:** the interval is hardcoded `delay(2000)`; `timeLapseIntervalSec` is never read (§C9).
+  - [ ] Time-lapse intervalometer ticker. — **FALSIFIED as committed in `a61ed9c`:** the interval was hardcoded `delay(2000)`. **FIXED in `7ac0795`** (`CommixViewModel.kt:324-325` reads `timeLapseIntervalSec`, 500 ms floor); no test yet.
   - [x] Automation Keyframe multi-track spline engine ticker (zoom, ISO, shutter, focus). — *automation runs Kotlin-side; the native keyframe engine is only programmed and never ticked (§B1).*
   - [x] State management with immutable `UiState` and `StateFlow`.
   - [ ] Real-time 30Hz seqlock telemetry polling driving live scopes and audio VU meter. — **FALSIFIED:** polling exists, but the seqlock underneath is broken and can deliver torn or silently dropped frames (§A2).
-- [ ] *Added by audit:* Fix `CommixRepository.updateParams()` — `oldMode`/`oldVideoRes` are read **after** the assignment, so mode/resolution changes never trigger a session reconfiguration (§C2).
+- [ ] *Added by audit:* Fix `CommixRepository.updateParams()` — old values were read **after** the assignment, so mode/resolution changes never triggered a session reconfiguration (§C2). **FIXED in `7ac0795`** (captured before `currentParams = enriched`, `CommixRepository.kt:635-640`); no dedicated test yet.
 
 ---
 
@@ -139,7 +139,7 @@
   - [x] `ProVideoFormatModal`: Magnetic float FPS snapping and bitrate sliders.
   - [x] `CinemaSlateSheet`: Fullscreen clapperboard with animated clapper arm and sync tone.
   - [x] `KeyframeEditorModal`: Interactive multi-track spline curve editor.
-  - [ ] `ProcessingQueueSheet`: Asynchronous background computational jobs viewer. — **FALSIFIED:** all production jobs are enqueued with no execution block and after the work — the queue shows simulated progress bars for work it did not do; pause/cancel cancel nothing (§C10).
+  - [ ] `ProcessingQueueSheet`: Asynchronous background computational jobs viewer. — **PARTLY ADDRESSED in `7ac0795`:** the queue now stores and runs execution blocks, and cancel actually cancels the coroutine (§C10). Still false in production: the three `enqueueJob` call sites (`CommixRepository.kt:955, 1303, 1367`) pass no execution block, so the sheet can still show simulated progress.
 - [x] Implement `CameraScreen`:
   - [x] Master screen integrating Viewfinder, Top Bar, HUD, Rotary Dial, Carousel, and Shutter.
   - [x] Dynamic navigation bar inset padding (`36.dp + navBottom`) preventing any clipping.
@@ -148,13 +148,13 @@
 - [x] Verification & Performance Polish:
   - [ ] 120Hz zero-jank frame rendering with Strong Skipping mode. — **UNVERIFIED:** no measurement, test, or artifact exists; the 30 Hz telemetry loop allocates fresh arrays every tick (§A12).
   - [ ] Zero-copy JNI memory transfer via `TelemetrySharedBuffer` seqlock protocol. — **FALSIFIED:** same as §A2 — mutex writers, torn-read-accepting reader, non-atomic fields.
-  - [x] Clean R8 full-mode release compilation (`assembleRelease` verified). — **Independently verified 2026-10-15:** `BUILD SUCCESSFUL`, 82/82 unit tests green, APK contains `lib/arm64-v8a/libcommix_native.so`. **Caveats:** APK is signed with the Android Debug key; the wrapper-pinned Gradle 9.3.1 could not be tested in this environment; the 82 green tests are tautological and cover none of the defects above (§E).
+  - [ ] Clean R8 full-mode release compilation (`assembleRelease` verified). — **FALSIFIED as committed in `a61ed9c`:** a clean checkout FAILS resource linking — `AAPT: resource mipmap/ic_launcher not found`; the launcher icons were never committed (§F). `7ac0795` commits the icons and lands the first fix batch. With them present, the tree built (Gradle 8.14: BUILD SUCCESSFUL, APK with `libcommix_native.so`; debug-signed). Re-check only after a release build of `7ac0795` is run and its output pasted.
 
 ---
 
-## Independent Verification Log (2026-10-15)
+## Independent Verification Log (2026-10-15/16)
 
-- Toolchain: Gradle 8.14 + AGP 8.7.3 → `:app:testReleaseUnitTest :app:assembleRelease` **BUILD SUCCESSFUL** (18m07s), 82/82 tests, `app-release.apk` (4.6 MB) contains `lib/arm64-v8a/libcommix_native.so`, signed with the **Android Debug** certificate.
-- Gradle 9.1.0 control build (Gradle 9 line, matching the wrapper's 9.3.1 pin): **result recorded in `AUDIT.md` §F**.
-- Full findings: `AUDIT.md`. Re-check rules: `AGENTS.md` §1 and §4.
-- Note: several items above are cross-referenced to "§" — those refer to `AUDIT.md` sections.
+- **`a61ed9c`, clean checkout, Gradle 8.14: `BUILD FAILED`** — `AAPT: resource mipmap/ic_launcher not found` (launcher icons referenced by the manifest were never committed). The commit as submitted cannot assemble.
+- **`7ac0795` (the author's response):** debug JVM tests **83/83, 0 failures** (`app/build/test-results/testDebugUnitTest/*.xml`); dead files deleted; icons tracked. The native suite (`app/src/test/cpp/native_engine_test.cpp`) was recompiled and rerun by the auditor with `g++ -std=c++20 -Wall -Wextra -Werror` — all 7 suites pass — but it is **not wired into any build**, asserts only the Gyroflow header (not row values), and has no concurrency test.
+- Still open after `7ac0795`: IMU/Gyroflow junk data, silent videos + synthetic PTS, `Fmp4Muxer`, best-shot velocity, settings theater (§D), preview rotation, native-test automation, debug signing. Full list in `AUDIT.md` §I.
+- Full findings: `AUDIT.md`. Re-check rules: `AGENTS.md` §1 and §4. Section refs (§A–§I) refer to `AUDIT.md`.
