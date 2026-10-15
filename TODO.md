@@ -148,7 +148,7 @@
 - [x] Verification & Performance Polish:
   - [ ] 120Hz zero-jank frame rendering with Strong Skipping mode. — **UNVERIFIED:** no measurement, test, or artifact exists; the 30 Hz telemetry loop allocates fresh arrays every tick (§A12).
   - [ ] Zero-copy JNI memory transfer via `TelemetrySharedBuffer` seqlock protocol. — **FALSIFIED:** same as §A2 — mutex writers, torn-read-accepting reader, non-atomic fields.
-  - [ ] Clean R8 full-mode release compilation (`assembleRelease` verified). — **FALSIFIED as committed in `a61ed9c`:** a clean checkout FAILS resource linking — `AAPT: resource mipmap/ic_launcher not found`; the launcher icons were never committed (§F). `7ac0795` commits the icons and lands the first fix batch. With them present, the tree built (Gradle 8.14: BUILD SUCCESSFUL, APK with `libcommix_native.so`; debug-signed). Re-check only after a release build of `7ac0795` is run and its output pasted.
+  - [x] Clean R8 full-mode release compilation (`assembleRelease` verified). — **Was FALSIFIED as committed in `a61ed9c`** (clean checkout failed resource linking; icons were never committed — §F). **VERIFIED 2026-10-16 on `7ac0795`:** `./gradlew :app:testReleaseUnitTest :app:assembleRelease` (wrapper-pinned Gradle 9.3.1) → **BUILD SUCCESSFUL in 8m 29s**; release tests 83/83; APK (4.6 MB) contains `lib/arm64-v8a/libcommix_native.so`. **Caveat (separate item):** the APK is debug-signed (`CN=Android Debug`) and `applicationId` still impersonates `org.codeaurora.snapcam` (§A10).
 
 ---
 
@@ -156,5 +156,6 @@
 
 - **`a61ed9c`, clean checkout, Gradle 8.14: `BUILD FAILED`** — `AAPT: resource mipmap/ic_launcher not found` (launcher icons referenced by the manifest were never committed). The commit as submitted cannot assemble.
 - **`7ac0795` (the author's response):** debug JVM tests **83/83, 0 failures** (`app/build/test-results/testDebugUnitTest/*.xml`); dead files deleted; icons tracked. The native suite (`app/src/test/cpp/native_engine_test.cpp`) was recompiled and rerun by the auditor with `g++ -std=c++20 -Wall -Wextra -Werror` — all 7 suites pass — but it is **not wired into any build**, asserts only the Gyroflow header (not row values), and has no concurrency test.
+- **Release build of `7ac0795` (2026-10-16):** `./gradlew :app:testReleaseUnitTest :app:assembleRelease` (wrapper-pinned Gradle 9.3.1) → **BUILD SUCCESSFUL in 8m 29s**; release tests 83/83; APK contains `lib/arm64-v8a/libcommix_native.so`; still debug-signed (`apksigner`: `CN=Android Debug`).
 - Still open after `7ac0795`: IMU/Gyroflow junk data, silent videos + synthetic PTS, `Fmp4Muxer`, best-shot velocity, settings theater (§D), preview rotation, native-test automation, debug signing. Full list in `AUDIT.md` §I.
 - Full findings: `AUDIT.md`. Re-check rules: `AGENTS.md` §1 and §4. Section refs (§A–§I) refer to `AUDIT.md`.

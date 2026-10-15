@@ -32,7 +32,7 @@ If you cannot produce all four, the checkbox stays `[ ]`. "It compiles" is not e
 ## 3. What is actually true (verified 2026-10-15/16, this machine)
 
 - **A clean checkout of `a61ed9c` does NOT build** — `AAPT: resource mipmap/ic_launcher not found` (the manifest references launcher icons that were never committed). The icons arrived untracked and are **committed in `7ac0795`** — build claims apply only from `7ac0795` onward. Never re-check "assembleRelease verified" for `a61ed9c`.
-- **`7ac0795` builds.** Debug JVM tests are green: **83/83** (`app/build/test-results/`); the wrapper-pinned Gradle 9.3.1 has run the build via `./gradlew` — the old "incompatible with Gradle 9.0" notice did not stop it. An earlier release build of this tree (Gradle 8.14) produced an APK containing `lib/arm64-v8a/libcommix_native.so`, **signed with the Android Debug key** — not a shipping artifact. Trust pasted output, not warnings.
+- **`7ac0795` builds.** Release path verified through the repo's own `./gradlew` (wrapper-pinned Gradle 9.3.1, 2026-10-16): `:app:testReleaseUnitTest :app:assembleRelease` → **BUILD SUCCESSFUL** (8m 29s), release unit tests 83/83, APK contains `lib/arm64-v8a/libcommix_native.so`. The old "incompatible with Gradle 9.0" notice did not stop it (only a Gradle-10 deprecation notice remains). The APK is **signed with the Android Debug key** (`apksigner`: `CN=Android Debug`) — not a shipping artifact. Trust pasted output, not warnings.
 - The C++ compiles and links, and `app/src/test/cpp/native_engine_test.cpp` passes (manual `g++`; **not wired into CMake/Gradle** — it detects nothing automatically yet).
 - 83 green JVM tests do **not** mean the features work: §§C3–C8, §D (settings theater) and §A2 (seqlock atomics) remain open (`AUDIT.md` §I).
 
