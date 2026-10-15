@@ -305,7 +305,7 @@ All files stamped 22:26:15 (one programmatic batch):
 - Dead twins deleted: `commix_native.cpp`, `commix_scopes.cpp/.h`, `ImagePipeline.kt`, `VulkanComputeEngine.kt` (§B3/B4).
 - Missing launcher resources added — they repair the pristine-checkout AAPT failure (§F). **Committed in `7ac0795`.**
 - `ProcessingJobQueue`: execution blocks stored and run; `cancelJob` cancels; `clearAll()` added; progress guarded by RUNNING status (§C10 — partly).
-- Seqlock: `write_begin()` now stamps `seq_end = odd`, closing the common torn-read interleaving (§A2b). Counters remain plain non-atomics, no reader retry loop, writer mutex remains — "lock-free" is still false.
+- Seqlock: `write_begin()` now stamps `seq_end = odd` and the published value changes every generation — the reader's `b1 == b2` check (`jni_bridge.cpp:126-147`, acquire fences present) now rejects torn/interleaved frames, so §A2b is practically closed. Residuals: the shared `seq_begin`/`seq_end` fields and all data fields remain plain, non-atomic (`uint32_t`/`float`/`int32_t`) — a formal data race under the C++ memory model; only the global generation counter is `std::atomic`; the reader single-shots (no retry); the writer mutex remains, so the "lock-free" claim (`commix_telemetry.h:15`) is still false.
 - Guards: scopes-JNI validation, Gyroflow null path, hyperfocal non-positive focal.
 
 ### Batch 2 — commit `7ac0795` (the author's response to this audit)
