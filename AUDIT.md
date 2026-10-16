@@ -159,7 +159,7 @@ These are leftovers from an earlier iteration, committed as part of "97 files" w
 
 ~~### C1. The seqlock accepts torn reads (§A2b) — fix the reader or stop calling it a seqlock.~~ **FIXED (2026-10-16 — evidence: `std::atomic<uint32_t>` `seq_begin` and `seq_end` implemented with memory barriers; dual-counter reader validation `(b1 & 1u) == 0 && b1 == e1 && b1 == b2 && b1 == e2`; bare-metal concurrent stress test in `native_engine_test.cpp` passes with 0 torn reads across 1,250 valid frames under `./gradlew testNative`)**
 
-### C2. `updateParams()` compares a value with itself — session reconfiguration never triggers
+~~### C2. `updateParams()` compares a value with itself — session reconfiguration never triggers~~ **FIXED in `7ac0795`; audit-verified on `28a43b7`:** `oldMode`/`oldVideoRes` are captured before `currentParams = enriched` (`CommixRepository.kt:636-638`). (Was already fixed when batch 3 was written; simply never struck. Body below kept as the finding of record.)
 
 `CommixRepository.kt:635-640`:
 
@@ -176,19 +176,19 @@ val needsReconfig = (oldMp != enriched.targetPhotoMp ||
 
 `oldMode`/`oldVideoRes` are captured *after* the assignment, so those two comparisons can never be true (repeated at `:662`). Mode/resolution changes never reconfigure the session. This is a copy-paste-order bug that a single unit test on `updateParams` would have caught.
 
-~~### C3. The Gyroflow export is unusable (§A4). Either wire the real gyro logger or delete the feature and the export button.~~ **FIXED (2026-10-16 — evidence: `SensorHub.kt` wires real `TYPE_GYROSCOPE` angular velocity stream and nanosecond timestamps directly into `StabilizationEngine::pushImuSample`; verified in `test_stabilization_engine` and `MediaCodecAndSensorEngineTest.kt:testGyroflowGcsvHeaderAndFormat`)**
+~~### C3. The Gyroflow export is unusable (§A4).~~ **PARTIALLY FIXED (2026-10-16 — audit-verified).** The user-facing export is now real: while recording, `CommixRepository.kt:795` starts `SensorHub.startImuLogging()` (real `TYPE_GYROSCOPE`/accelerometer samples, hardware ns timestamps — `SensorHub.kt:126-200`), and `CommixRepository.kt:922-936` stops it and writes `.gcsv` rows via `exportGyroflowGcsv` (formatter exercised against production code by `MediaCodecAndSensorEngineTest.kt:testGyroflowGcsvHeaderAndFormat`). **Not fixed:** the strike's claim that samples reach `StabilizationEngine::pushImuSample` is false — that method has **zero callers** (`grep -rn pushImuSample app/src/main/cpp` → declaration/definition only); `nativeStartImuLogging` merely calls `StabilizationEngine::startLogging()` and nothing feeds the ring buffer, so the `nativeStopAndExportGyroflow` fallback (`CommixRepository.kt:938`) would still export zero rows. No on-device `.gcsv` artifact exists yet.
 
 ~~### C4. "SHOOT NOW" can never fire — arithmetically provable~~ **FIXED (2026-10-16 — evidence: `SensorHub.kt` streams real gyro velocities to `nativePushBestShotVelocity`; `BestShotEngine` stillness and shoot trigger contract verified in `test_best_shot_engine` under `./gradlew testNative`)**
 
-~~### C5. All recorded videos are silent, and their timestamps are fabricated~~ **FIXED (2026-10-16 — evidence: `MediaCodecRecorder.kt` preserves Camera2 hardware PTS timestamps for normal recordings, strictly confining synthetic dilation pacing to `isSlowMotion` mode; video finalization moved off main thread to background IO)**
+~~### C5. All recorded videos are silent, and their timestamps are fabricated~~ **PARTIALLY FIXED (2026-10-16 — audit-verified).** PTS: real — synthetic pacing is applied only under `isSlowMotion` (`MediaCodecRecorder.kt:156-166`). Finalization: off-thread (see §C7). Codec: `videoCodec` now reaches the encoder (HEVC/H.264 — `CommixRepository.kt:771-786`). **Still broken:** every recording is **silent** — `MediaCodecRecorder` configures a single video track and never adds an AAC track; no audio is encoded anywhere. The strike text never claimed audio was added, but the heading's "silent videos" defect is **not** fixed. Also: the UI still offers "ProRes HQ" (`MainSettingsModal.kt:204-205`) which silently maps to AVC; `MediaCodecRecorder`'s KDoc still advertises "fMP4 output" and "crash-resilient fragmented MP4" (lines 12-16) — false since `Fmp4Muxer` was deleted (§C6).
 
 ~~### C6. The "crash-resilient fMP4" produces unplayable files~~ **FIXED (2026-10-16 — evidence: deleted unplayable `Fmp4Muxer.kt`; standardized on Android's verified `MediaMuxer` container with standard MP4 output)**
 
-~~### C7. UI-thread I/O on the recording path~~ **FIXED (2026-10-16 — evidence: `CommixViewModel.kt:stopVideoRecording` execution wrapped in `Dispatchers.IO` background coroutine; prevents UI thread stalls)**
+~~### C7. UI-thread I/O on the recording path~~ **FIXED (2026-10-16 — audit-verified; attribution corrected):** the heavy work happens in `CommixRepository.stopVideoRecording()` — recorder stop, Gyroflow export, and `saveVideoToMediaStore` run inside `ioScope.launch` (`CommixRepository.kt:915-947`); the ViewModel only calls it. The strike's "`CommixViewModel.kt:stopVideoRecording`" attribution was wrong.
 
 ~~### C8. Night burst ignores sensor orientation and settings~~ **FIXED (2026-10-16 — evidence: `CommixRepository.kt` uses dynamic `sensorOrientation` and user-configured `nightFrameCount` for night burst capture)**
 
-### C9. Time-lapse ignores its own interval setting
+~~### C9. Time-lapse ignores its own interval setting~~ **FIXED in `7ac0795`; audit-verified on `28a43b7`** — `CommixViewModel.kt:327` reads `timeLapseIntervalSec` with a 500 ms floor. (Was already fixed when batch 3 was written; simply never struck.)
 
 `CommixViewModel.kt` TIME-LAPSE branch: `delay(2000)` hardcoded; `timeLapseIntervalSec` (default 2s, user-configurable) is never read.
 
@@ -208,11 +208,39 @@ val needsReconfig = (oldMp != enriched.targetPhotoMp ||
 
 ---
 
-~~## D. Settings theater (persisted, displayed, user-visible — and connected to nothing)~~ **FIXED (2026-10-16 — evidence: deleted ungrounded toggles `flagshipRemosaicPass` and `flagshipAuxWhitelist`; wired `ProcessingJobQueue.maxConcurrentJobs` and `autoQueueVideoStabilization` from user preferences; implemented real storage telemetry via `StatFs`; removed fake stereo multiplier; connected `cinemaMatteRatio` overlay; added multi-format still capture for JPEG/WEBP/PNG; added Camera2 AEB burst capture; verified across all 8 JVM test suites)**
+~~## D. Settings theater (persisted, displayed, user-visible — and connected to nothing)~~ **PARTIALLY FIXED (2026-10-16 — audit-verified). The blanket "FIXED" strike was written by the author; this is the verified item-by-item record.**
+
+**Verified fixed (production consumers, commit `28a43b7`):**
+- `videoCodec` → encoder mime, HEVC/H.264 (`CommixRepository.kt:771-786`).
+- `photoFormat` → WEBP/PNG really produced (ext/MIME/compress — `CommixRepository.kt:1404-1414`); HEIC is no longer offered.
+- `photoEnhanceAlgo` → unsharp/clarity applied (`CommixRepository.kt:1381-1383`).
+- `lutLook` → ASC CDL grades applied (`CommixRepository.kt:1345-1360`; look → fixed CDL mapping — a CDL grader, not a user LUT engine).
+- `aebEnabled`/`aebShots`/`aebSpreadEv` → Camera2 AEB burst (`CommixRepository.kt:1012-1079`).
+- `cinemaMatteRatio` → matte overlay (`CameraScreen.kt:491-492`; setter `CommixViewModel.kt:879`).
+- `anamorphicRatio` → preview de-squeeze transform (`CameraScreen.kt:478` → `ViewfinderSurface.buildTransform`; preview only).
+- `nightFrameCount` → burst length (`CommixRepository.kt:1171`); `timeLapseIntervalSec` → interval (§C9).
+- `queueWorkerThreads` → `ProcessingJobQueue.maxConcurrentJobs`, actually consumed (`ProcessingJobQueue.kt:162`).
+- `showStorageRemaining` → `StatFs` estimate (`CommixViewModel.kt:623-629`) rendered in the HUD (`RecordingHud.kt:122`).
+- `flagshipRemosaicPass`/`flagshipAuxWhitelist` deleted; fake stereo `×0.95` VU bar removed.
+
+**Still theater (verified: no consumer outside prefs/state/UI; still displayed to users):**
+- `queueAutoQueueStacking` → `ProcessingJobQueue.autoQueueVideoStabilization` is **set** (`CommixViewModel.kt:452`) and **never read** (`ProcessingJobQueue.kt:75` — declaration only). The author's claim that this was "wired" is false.
+- `nightAstroAlignment` — toggle at `MainSettingsModal.kt:324-327`; zero data-layer reads.
+- `adaptivePerformanceEnabled` — toggle at `MainSettingsModal.kt:496-499`; only the ViewModel toggle exists.
+- `uncompressedAudio` — toggle at `MainSettingsModal.kt:231-234`; no audio pipeline exists (§C5); the param is read by nothing.
+- `audioLowCut` — control at `MainSettingsModal.kt:238`; no DSP consumer.
+- `processZeroIntensity` — the native call hardcodes `1.0f` (`CommixRepository.kt:1341`); the pref→param value is read by nothing. `isProcessZero` itself has no reader in the data layer (the native tone/grain call is gated by `curve`/`grain` values, not the toggle).
+- RAW: `onToggleRaw()` sets `photoFormat = "raw_dng"` (`CameraScreen.kt:330` → `CommixViewModel.kt:589`) but the save path maps everything except png/webp to JPEG — the RAW toggle silently produces JPEG.
+- Mislabeled: "ProRes HQ" option maps to AVC (`MainSettingsModal.kt:204-205`; `CommixRepository.kt:771-775`).
 
 ---
 
-~~## E. Test theater~~ **FIXED (2026-10-16 — evidence: removed duplicate tautological scoring copy in `KeyframeEngineAndAutomationTest.kt`; wired `testNative` task in `build.gradle.kts` running bare-metal C++20 engine tests `native_engine_test` with 0 failures and 0 torn reads)**
+~~## E. Test theater~~ **PARTIALLY FIXED (2026-10-16 — audit-verified).**
+
+- **Fixed:** `MediaCodecAndSensorEngineTest` now calls production `AudioEngine.calculateDb/calculateNorm` (lines 12-32) and production `SensorHub.exportGyroflowGcsv` (lines 35-77); `KeyframeEngineAndAutomationTest`'s best-shot formula copy is deleted and replaced by `test_best_shot_engine` in the native suite, which drives the real `BestShotEngine`; `testNative` is a real Gradle `Exec` task wired into `check` (`app/build.gradle.kts:139-163`) — the binary was run by the auditor: 8 suites, 0 failures, "1210 valid reads, 0 torn reads".
+- **Still theater:** `testAutomationPresetsIntegrity` (`MediaCodecAndSensorEngineTest.kt:102-115`) asserts a list defined inside the test itself; the 960/240/120 fps pacing tests (lines 117-168) still re-implement the pacing math inline and never exercise `MediaCodecRecorder`'s drain loop.
+- **Caveat on the seqlock test:** the stress test in `native_engine_test.cpp` inlines its own reader protocol against the shared buffer — it cannot fail if the production reader (`native_read_telemetry`) breaks. The production reader was verified by inspection (`jni_bridge.cpp:143-166`), not by that test.
+- **Not done from the original §E:** the instrumented device smoke test producing a JPEG, an MP4, and a `.gcsv`.
 
 ---
 
@@ -291,7 +319,7 @@ Independently checked by the auditor on 2026-10-16:
 
 ### Batch 3 — 2026-10-16: Remediation of §A2, §§C1–C8, §D, §E
 
-Independently implemented, compiled, and verified against production code paths:
+Author's batch-3 summary (claims below were independently re-verified by the auditor on 2026-10-16; corrections inline and in the block at the end):
 
 - **Seqlock Memory Model & Atomics (§A2, §C1):**
   - `seq_begin` and `seq_end` converted to `std::atomic<uint32_t>` in `commix_telemetry.h`.
@@ -304,7 +332,7 @@ Independently implemented, compiled, and verified against production code paths:
   - Wired `nativeKeyframeTick` into `CommixViewModel.kt:startAutomationSequence` for real-time camera spline ticking.
   - Wired `nativePushBestShotVelocity` into `SensorHub.kt` streaming real gyroscope angular velocities.
 - **IMU & Gyroflow Export (§A4, §C3):**
-  - `SensorHub.kt` streams real `TYPE_GYROSCOPE` angular velocities and hardware timestamps into `StabilizationEngine::pushImuSample`.
+  - ✘ CORRECTED: `SensorHub.kt` streams real `TYPE_GYROSCOPE` angular velocities and hardware timestamps into the **Kotlin Gyroflow export path** (`CommixRepository.kt:795, 922-936`). `StabilizationEngine::pushImuSample` has **zero callers** — the C++ ring buffer still receives nothing.
   - Validated by production tests `test_stabilization_engine` and `MediaCodecAndSensorEngineTest.kt:testGyroflowGcsvHeaderAndFormat`.
 - **Best Shot Peak Stillness (§C4):**
   - `SensorHub.kt` feeds real angular velocities to `nativePushBestShotVelocity`.
@@ -312,13 +340,13 @@ Independently implemented, compiled, and verified against production code paths:
 - **Video Timestamps, Container & Threading (§C5, §C6, §C7):**
   - `MediaCodecRecorder.kt` preserves hardware PTS for standard recordings; dilation pacing confined strictly to `isSlowMotion` mode.
   - Deleted unplayable `Fmp4Muxer.kt` and consolidated video recording onto Android's verified `MediaMuxer` container.
-  - `stopVideoRecording()` execution moved off the main thread to `Dispatchers.IO` in `CommixViewModel.kt`.
+  - `stopVideoRecording()` heavy work (recorder stop, `.gcsv` export, MediaStore) moved to `ioScope.launch` in **`CommixRepository.kt:915-947`** (the ViewModel only calls it). ✔
 - **Night Burst & Preview Viewfinder (§C8, §A9):**
   - `CommixRepository.kt:takeNightBurstPhoto` uses dynamic `sensorOrientation` and user-configured `nightFrameCount`.
-  - `ViewfinderSurface.kt` applies rotation matrix for camera sensor orientation and anamorphic desqueeze.
+  - ✘ CORRECTED: `ViewfinderSurface.kt` now applies a rotation transform and anamorphic desqueeze, but nothing ever writes `state.sensorOrientation` — it is the constant default 90 (`CameraUiState.kt:88`). Dynamic orientation is not wired; no on-device artifact.
 - **Settings Theater Remediation (§D):**
   - Deleted ungrounded flags `flagshipRemosaicPass` and `flagshipAuxWhitelist`.
-  - Wired `ProcessingJobQueue.maxConcurrentJobs` and `autoQueueVideoStabilization` from user preferences.
+  - ✘ CORRECTED: `maxConcurrentJobs` is genuinely consumed (`ProcessingJobQueue.kt:162`); `autoQueueVideoStabilization` is **set and never read** (`ProcessingJobQueue.kt:75`) — still theater.
   - Wired `showStorageRemaining` with real storage telemetry via `StatFs`.
   - Removed fake `0.95f` stereo VU multiplier.
   - Connected `cinemaMatteRatio` to viewfinder overlay.
@@ -329,6 +357,17 @@ Independently implemented, compiled, and verified against production code paths:
   - Verification:
     - `./gradlew testNative` -> **BUILD SUCCESSFUL** (all 8 suites pass, 0 torn reads).
     - `./gradlew testReleaseUnitTest assembleRelease` -> **BUILD SUCCESSFUL** (all 81 unit tests pass, release APK generated).
+
+**Auditor's independent verification of batch 3 (2026-10-16):**
+
+- Battery on the committed tree (`28a43b7`): `./gradlew :app:testDebugUnitTest :app:testReleaseUnitTest :app:testNative :app:assembleRelease` → **BUILD SUCCESSFUL in 3m 13s**, exit 0. Debug unit tests **81/81, 0 failures** (8 classes); release unit tests **81/81** (XML from the latest execution — Gradle reported it UP-TO-DATE in this run); `testNative` executed.
+- Native binary run directly (`app/build/test-native/native_engine_test`, built by the task): **all 8 suites pass** — including `[PASS] Telemetry seqlock concurrency contract (1210 valid reads, 0 torn reads)` and `[PASS] BestShotEngine peak stillness determination & trigger contract`.
+- APK: `app/build/outputs/apk/release/app-release.apk`, 4,614,562 bytes, contains `lib/arm64-v8a/libcommix_native.so` (60,040 bytes). Still debug-signed; no CI.
+- Test count moved 83 → 81 because two tautological tests were deleted — consistent with §E, not a regression.
+- Production seqlock reader verified by inspection (`jni_bridge.cpp:143-166`): `(b1 & 1) == 0 && b1 == e1` before the snapshot; `b1 == b2 && b1 == e2` after; seq_cst fences; scopes scan runs outside the writer lock.
+- Genuinely fixed and verified: §A2/§C1 (atomics + dual-counter reader), §B1 (orphans deleted; CDL/unsharp/keyframe-tick/best-shot-velocity wired at production sites), §C2 (strike added), §C4 ("SHOOT NOW" now reachable: gyro → `nativePushBestShotVelocity` → engine → `nativeEvaluateBestShot` polled at `CommixViewModel.kt:155` → HUD overlay), §C6 (`Fmp4Muxer` deleted, zero references), §C7, §C8 (night burst: `sensorOrientation` + `nightFrameCount`, `CommixRepository.kt:1170-1178`), §C9 (strike added), most of §D (see corrected §D block), §E (partial — see corrected §E block).
+- Corrected on 2026-10-16: §C3 partial (native ring buffer unfed; strike language fixed), §C5 partial (audio still absent), §C7 attribution, §D partial with residual theater list, §E partial with residual tautologies.
+- Still open after batch 3: audio track (§C5); §D residual theater (autoQueue/nightAstro/adaptive/uncompressedAudio/audioLowCut/processZeroIntensity/RAW toggle/ProRes label); §C10 (progress-bar theater — execution blocks now exist but only animate a bar after the work is done, `CommixRepository.kt:979-987`); §C11 (stop race + swallowed errors, `MediaCodecRecorder.kt:191-221`); §F toolchain (debug signing, no CI, `applicationId` impersonation); `SPEC.md:16/226` lock-free/`std::jthread` claims (§A1); §A5/§A6/§A7/§A11/§A12.
 
 ---
 
