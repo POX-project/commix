@@ -191,9 +191,9 @@ class ProcessingJobQueue private constructor() {
                     }
                 } else {
                     val stages = listOf(
-                        "Allocating direct buffers" to 0.25f,
-                        "Executing SIMD NEON processing" to 0.6f,
-                        "Writing container atom headers" to 0.9f,
+                        "Allocating buffers" to 0.25f,
+                        "Processing frame data" to 0.6f,
+                        "Finalizing output" to 0.9f,
                         "Syncing to filesystem" to 1.0f
                     )
                     for ((stageName, targetProgress) in stages) {
@@ -209,7 +209,7 @@ class ProcessingJobQueue private constructor() {
                 }
             } catch (e: CancellationException) {
                 _jobs.update { list ->
-                    list.map { if (it.id == jobId) it.copy(status = JobStatus.CANCELLED, currentStage = "Cancelled") else it }
+                    list.map { if (it.id == jobId) it.copy(status = JobStatus.CANCELLED, currentStage = "Cancelled by user") else it }
                 }
             } catch (e: Exception) {
                 _jobs.update { list ->

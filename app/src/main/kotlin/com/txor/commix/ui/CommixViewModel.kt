@@ -11,8 +11,10 @@ import androidx.lifecycle.viewModelScope
 import com.txor.commix.CaptureRequestParams
 import com.txor.commix.PanoramaStitcher
 import com.txor.commix.PipelineThroughputEngine
+import com.txor.commix.ProcessingJobQueue
 import com.txor.commix.automation.AutomationEngine
 import com.txor.commix.automation.AutomationPresetConfig
+import com.txor.commix.automation.AutomationValues
 import com.txor.commix.bridge.NativeEngineBridge
 import com.txor.commix.data.CommixRepository
 import com.txor.commix.model.CameraUiState
@@ -109,6 +111,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
         }
+        updateStorageTelemetry()
     }
 
     private var videoTimerJob: kotlinx.coroutines.Job? = null
@@ -407,6 +410,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onFormatChanged(format: String, quality: Int) {
         _uiState.update { it.copy(photoFormat = format, photoQuality = quality) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
     }
 
     private fun updateRepositoryParams() {
@@ -430,8 +434,22 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
             isProcessZero = s.isProcessZeroActive,
             processZeroIntensity = s.processZeroIntensity,
             flashMode = s.flashMode,
-            isViewfinderDisabled = s.viewfinderDisabled
+            isViewfinderDisabled = s.viewfinderDisabled,
+            videoCodec = s.videoCodec,
+            nightFrameCount = s.nightFrameCount,
+            nightAstroAlignment = s.nightAstroAlignment,
+            timeLapseIntervalSec = s.timeLapseIntervalSec,
+            uncompressedAudio = s.uncompressedAudio,
+            cinemaMatteRatio = s.cinemaMatteRatio,
+            photoFormat = s.photoFormat,
+            photoEnhanceAlgo = s.photoEnhanceAlgo,
+            aebEnabled = s.aebEnabled,
+            aebShots = s.aebShots,
+            aebSpreadEv = s.aebSpreadEv,
+            anamorphicRatio = s.anamorphicRatio
         )
+        ProcessingJobQueue.instance.maxConcurrentJobs = s.queueWorkerThreads.coerceIn(1, 8)
+        ProcessingJobQueue.instance.autoQueueVideoStabilization = s.queueAutoQueueStacking
         repository.exifOptions = com.txor.commix.model.ExifOptions(
             cameraInfo = s.exifCameraInfo,
             location = s.exifLocation,
@@ -525,7 +543,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update {
             it.copy(
                 availableCameras = probed,
-                statusMessage = "Probing IDs -10000..10000..."
+                statusMessage = "Probing candidate sensor IDs 0..128..."
             )
         }
         repository.startBackgroundIdSpam { newCam ->
@@ -594,7 +612,22 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
                 videoBitrateBps = bitrateBps
             )
         }
+        updateStorageTelemetry()
         preferences.save(_uiState.value)
+    }
+
+    fun updateStorageTelemetry() {
+        try {
+            val app = getApplication<android.app.Application>()
+            val dir = app.getExternalFilesDir(null) ?: app.filesDir
+            val stat = android.os.StatFs(dir.absolutePath)
+            val availableBytes = stat.availableBytes
+            val bitrate = _uiState.value.videoBitrateBps.takeIf { it > 0 } ?: 20_000_000
+            val bytesPerSec = bitrate / 8
+            val remainingSec = if (bytesPerSec > 0) availableBytes / bytesPerSec else 0L
+            val remainingMins = (remainingSec / 60L).toInt().coerceAtLeast(0)
+            _uiState.update { it.copy(estimatedTimeRemainingMinutes = remainingMins) }
+        } catch (_: Throwable) {}
     }
 
     fun getSupportedVideoSizes(): List<String> {
@@ -818,6 +851,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onSetVideoCodec(codec: String) {
         _uiState.update { it.copy(videoCodec = codec) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus("Video Codec: ${codec.uppercase()}")
     }
 
@@ -831,6 +865,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         val next = !_uiState.value.uncompressedAudio
         _uiState.update { it.copy(uncompressedAudio = next) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus(if (next) "Audio: LPCM 48kHz Uncompressed" else "Audio: AAC Standard")
     }
 
@@ -843,12 +878,14 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onSetCinemaMatteRatio(ratio: String) {
         _uiState.update { it.copy(cinemaMatteRatio = ratio) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus("Cinema Matte: $ratio")
     }
 
     fun onSetNightFrameCount(frames: Int) {
         _uiState.update { it.copy(nightFrameCount = frames) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus("Night Multi-Frame Burst: $frames Frames")
     }
 
@@ -856,6 +893,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         val next = !_uiState.value.nightAstroAlignment
         _uiState.update { it.copy(nightAstroAlignment = next) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus(if (next) "Astro Star Tracking: Active" else "Astro Star Tracking: Off")
     }
 
@@ -874,22 +912,10 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onSetTimeLapseInterval(sec: Int) {
         _uiState.update { it.copy(timeLapseIntervalSec = sec) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus("Time-Lapse Interval: ${sec}s")
     }
 
-    fun onToggleFlagshipRemosaic() {
-        val next = !_uiState.value.flagshipRemosaicPass
-        _uiState.update { it.copy(flagshipRemosaicPass = next) }
-        preferences.save(_uiState.value)
-        showStatus(if (next) "MediaTek Imagiq Remosaic Pass Enabled" else "Remosaic Pass Bypassed")
-    }
-
-    fun onToggleFlagshipAuxWhitelist() {
-        val next = !_uiState.value.flagshipAuxWhitelist
-        _uiState.update { it.copy(flagshipAuxWhitelist = next) }
-        preferences.save(_uiState.value)
-        showStatus(if (next) "Qualcomm Aux Package Whitelist Active" else "Aux Whitelist Standard")
-    }
 
     fun onSetAutomationTrigger(trigger: String) {
         _uiState.update { it.copy(automationTriggerMode = trigger) }
@@ -1152,7 +1178,23 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
                     val elapsedSec = (elapsedMs / 1000f).coerceAtMost(config.durationSeconds)
                     val progress = (elapsedMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
 
-                    val values = config.evaluate(elapsedSec)
+                    val nativeValues = FloatArray(6)
+                    val ticked = if (com.txor.commix.bridge.NativeEngineBridge.isLoaded) {
+                        com.txor.commix.bridge.NativeEngineBridge.nativeKeyframeTick(0.033f, nativeValues)
+                    } else false
+
+                    val values = if (ticked) {
+                        AutomationValues(
+                            zoom = if (nativeValues[0] > 0f) nativeValues[0].toDouble() else null,
+                            iso = if (nativeValues[1] > 0f) nativeValues[1].toInt() else null,
+                            shutterNs = if (nativeValues[2] > 0f) nativeValues[2].toLong() else null,
+                            ev = if (nativeValues[3] != 0f) nativeValues[3] else null,
+                            wbKelvin = if (nativeValues[4] > 0f) nativeValues[4].toInt() else null,
+                            focusDiopters = if (nativeValues[5] >= 0f) nativeValues[5] else null
+                        )
+                    } else {
+                        config.evaluate(elapsedSec)
+                    }
 
                     _uiState.update { cur ->
                         var updated = cur.copy(

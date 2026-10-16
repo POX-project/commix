@@ -4,9 +4,7 @@
 #include <mutex>
 
 static TelemetrySharedBuffer g_telemetry_buffer{};
-static std::atomic<uint32_t> g_sequence_counter{0};
 static std::mutex g_telemetry_mutex;
-static thread_local uint32_t tl_write_seq = 0;
 
 extern "C" {
 
@@ -16,19 +14,17 @@ TelemetrySharedBuffer* commix_get_telemetry_buffer(void) {
 
 void commix_telemetry_write_begin(void) {
     g_telemetry_mutex.lock();
-    uint32_t seq = g_sequence_counter.load(std::memory_order_relaxed);
-    tl_write_seq = (seq << 1) | 1u; // Guaranteed odd: write in progress
-    g_telemetry_buffer.seq_end = tl_write_seq;
-    g_telemetry_buffer.seq_begin = tl_write_seq;
-    std::atomic_thread_fence(std::memory_order_release);
+    uint32_t cur = g_telemetry_buffer.seq_begin.load(std::memory_order_seq_cst);
+    uint32_t odd = (cur & ~1u) + 1u; // Strict odd: write in progress
+    g_telemetry_buffer.seq_end.store(odd, std::memory_order_seq_cst);
+    g_telemetry_buffer.seq_begin.store(odd, std::memory_order_seq_cst);
 }
 
 void commix_telemetry_write_end(void) {
-    std::atomic_thread_fence(std::memory_order_release);
-    uint32_t even = tl_write_seq + 1u; // Guaranteed even: write complete
-    g_telemetry_buffer.seq_end = even;
-    g_telemetry_buffer.seq_begin = even;
-    g_sequence_counter.fetch_add(1, std::memory_order_relaxed);
+    uint32_t cur = g_telemetry_buffer.seq_begin.load(std::memory_order_seq_cst);
+    uint32_t even = (cur & 1u) ? cur + 1u : cur + 2u; // Strict even: write complete
+    g_telemetry_buffer.seq_end.store(even, std::memory_order_seq_cst);
+    g_telemetry_buffer.seq_begin.store(even, std::memory_order_seq_cst);
     g_telemetry_mutex.unlock();
 }
 

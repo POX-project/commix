@@ -46,8 +46,6 @@ class UniversalSettingsAndExifTest {
         assertTrue(state.nightAstroAlignment)
         assertEquals(120, state.slowMoFps)
         assertEquals(2, state.timeLapseIntervalSec)
-        assertTrue(state.flagshipRemosaicPass)
-        assertTrue(state.flagshipAuxWhitelist)
         assertEquals("timer", state.automationTriggerMode)
         assertEquals(2, state.queueWorkerThreads)
         assertTrue(state.queueAutoQueueStacking)

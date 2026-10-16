@@ -55,13 +55,6 @@ object NativeEngineBridge {
         frameRate: Double
     ): Boolean
 
-    @JvmStatic
-    external fun nativeComputeL1Path(
-        inputTraj: FloatArray,
-        outputTraj: FloatArray,
-        count: Int,
-        lambda: Float
-    )
 
     @JvmStatic
     external fun nativePushBestShotVelocity(gx: Float, gy: Float, gz: Float)

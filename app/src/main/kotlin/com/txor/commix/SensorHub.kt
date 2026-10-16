@@ -66,6 +66,17 @@ class SensorHub(private val context: Context, private val onOrientationChanged: 
         rotationListener = object : SensorEventListener {
             override fun onSensorChanged(event: SensorEvent?) {
                 if (event == null) return
+
+                if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
+                    val gx = event.values[0]
+                    val gy = event.values[1]
+                    val gz = event.values[2]
+                    if (com.txor.commix.bridge.NativeEngineBridge.isLoaded) {
+                        com.txor.commix.bridge.NativeEngineBridge.nativePushBestShotVelocity(gx, gy, gz)
+                    }
+                    return
+                }
+
                 val now = System.currentTimeMillis()
                 if (now - lastOrientationMs < 16) return
                 lastOrientationMs = now
@@ -95,6 +106,11 @@ class SensorHub(private val context: Context, private val onOrientationChanged: 
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
         }
 
+        val gyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        if (gyro != null) {
+            try { sm.registerListener(rotationListener, gyro, SensorManager.SENSOR_DELAY_GAME) } catch (_: Exception) {}
+        }
+
         return try {
             sm.registerListener(rotationListener, sensor, SensorManager.SENSOR_DELAY_GAME)
         } catch (_: Exception) {
@@ -122,6 +138,9 @@ class SensorHub(private val context: Context, private val onOrientationChanged: 
                     lastGyroX = event.values[0]
                     lastGyroY = event.values[1]
                     lastGyroZ = event.values[2]
+                    if (com.txor.commix.bridge.NativeEngineBridge.isLoaded) {
+                        com.txor.commix.bridge.NativeEngineBridge.nativePushBestShotVelocity(lastGyroX, lastGyroY, lastGyroZ)
+                    }
                     val sample = ImuSample(
                         timestampNs = event.timestamp,
                         gyroX = lastGyroX,
@@ -189,22 +208,27 @@ class SensorHub(private val context: Context, private val onOrientationChanged: 
         return samples
     }
 
-    fun exportGyroflowGcsv(file: File, samples: List<ImuSample>) {
-        file.parentFile?.mkdirs()
-        file.bufferedWriter().use { writer ->
-            writer.write("GYROFLOW V1\n")
-            writer.write("t,gx,gy,gz,ax,ay,az\n")
-            val baseTs = if (samples.isNotEmpty()) samples.first().timestampNs else 0L
-            for (s in samples) {
-                val relTimeMs = (s.timestampNs - baseTs) / 1_000_000.0
-                writer.write(
-                    String.format(
-                        java.util.Locale.US,
-                        "%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                        relTimeMs, s.gyroX, s.gyroY, s.gyroZ, s.accelX, s.accelY, s.accelZ
+    companion object {
+        fun exportGyroflowGcsv(file: File, samples: List<ImuSample>) {
+            file.parentFile?.mkdirs()
+            file.bufferedWriter().use { writer ->
+                writer.write("GYROFLOW V1\n")
+                writer.write("t,gx,gy,gz,ax,ay,az\n")
+                val baseTs = if (samples.isNotEmpty()) samples.first().timestampNs else 0L
+                for (s in samples) {
+                    val relTimeMs = (s.timestampNs - baseTs) / 1_000_000.0
+                    writer.write(
+                        String.format(
+                            java.util.Locale.US,
+                            "%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                            relTimeMs, s.gyroX, s.gyroY, s.gyroZ, s.accelX, s.accelY, s.accelZ
+                        )
                     )
-                )
+                }
             }
         }
     }
+
+    fun exportGyroflowGcsv(file: File, samples: List<ImuSample>) =
+        Companion.exportGyroflowGcsv(file, samples)
 }

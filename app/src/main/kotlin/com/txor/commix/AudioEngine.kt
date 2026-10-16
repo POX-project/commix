@@ -15,7 +15,17 @@ import kotlin.math.pow
  * external USB audio device detection, and cinema slate tone generation.
  */
 class AudioEngine(private val context: Context) {
-    private val TAG = "CommixAudioEngine"
+    companion object {
+        private const val TAG = "CommixAudioEngine"
+
+        fun calculateDb(rms: Double): Double {
+            return if (rms > 0.0) 20.0 * kotlin.math.log10(rms / 32768.0) else -96.0
+        }
+
+        fun calculateNorm(db: Double): Double {
+            return ((db + 60.0) / 60.0).coerceIn(0.0, 1.0)
+        }
+    }
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private var toneGenerator: ToneGenerator? = null
     private var audioRecord: android.media.AudioRecord? = null
@@ -97,8 +107,8 @@ class AudioEngine(private val context: Context) {
                             sum += sample * sample
                         }
                         val rms = kotlin.math.sqrt(sum / read)
-                        val db = if (rms > 0.0) 20.0 * kotlin.math.log10(rms / 32768.0) else -96.0
-                        val norm = ((db + 60.0) / 60.0).coerceIn(0.0, 1.0)
+                        val db = calculateDb(rms)
+                        val norm = calculateNorm(db)
                         if (com.txor.commix.bridge.NativeTelemetryBridge.isLoaded) {
                             com.txor.commix.bridge.NativeTelemetryBridge.nativeWriteAudio(
                                 norm.toFloat(),

@@ -474,6 +474,8 @@ fun CameraScreen(
                     },
                     previewWidth = previewW,
                     previewHeight = previewH,
+                    sensorOrientation = state.sensorOrientation,
+                    anamorphicDeSqueeze = state.anamorphicRatio,
                     targetAspectRatio = targetRatio,
                     modifier = Modifier.graphicsLayer {
                         val hwMax = state.hardwareMaxDigitalZoom.coerceAtLeast(1.0)
@@ -486,8 +488,9 @@ fun CameraScreen(
                 )
 
                 // Cinema Anamorphic Letterbox Matte Overlay
-                if (state.activeMode == "CINEMATIC") {
-                    CinemaMatteOverlay(ratio = "2.39:1")
+                if (state.activeMode == "CINEMATIC" || (state.cinemaMatteRatio.isNotEmpty() && state.cinemaMatteRatio != "off")) {
+                    val matte = if (state.activeMode == "CINEMATIC") state.cinemaMatteRatio.ifEmpty { "2.39:1" } else state.cinemaMatteRatio
+                    CinemaMatteOverlay(ratio = matte)
                 }
 
                 // GCam-Style Panorama & 360 Degree Viewfinder Overlay
@@ -874,6 +877,7 @@ fun CameraScreen(
                         fps = state.videoFpsFloat,
                         bitrateBps = state.videoBitrateBps,
                         remainingMinutes = state.estimatedTimeRemainingMinutes,
+                        showStorageRemaining = state.showStorageRemaining,
                         modifier = Modifier
                             .align(Alignment.TopCenter)
                             .padding(top = 16.dp)

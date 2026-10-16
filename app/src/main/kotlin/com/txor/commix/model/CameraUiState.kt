@@ -85,6 +85,7 @@ data class CameraUiState(
     val azimuthDeg: Float = 0.0f,
     val pitchDeg: Float = 0.0f,
     val rollDeg: Float = 0.0f,
+    val sensorOrientation: Int = 90,
 
     // Telemetry & Best Shot
     val lumaHistogram: IntArray = IntArray(256),
@@ -145,8 +146,6 @@ data class CameraUiState(
     val nightTone: String = "neutral",
     val slowMoFps: Int = 120,
     val timeLapseIntervalSec: Int = 2,
-    val flagshipRemosaicPass: Boolean = true,
-    val flagshipAuxWhitelist: Boolean = true,
     val automationTriggerMode: String = "timer",
     val queueWorkerThreads: Int = 2,
     val queueAutoQueueStacking: Boolean = true

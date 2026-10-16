@@ -210,19 +210,95 @@ void test_telemetry_seqlock() {
     commix_write_audio(0.75f, -6.0f, -6.5f, -5.8f);
     auto* tb = commix_get_telemetry_buffer();
     assert(tb != nullptr);
-    assert(tb->seq_begin == tb->seq_end);
-    assert((tb->seq_begin & 1u) == 0); // Must be even (completed)
+    assert(tb->seq_begin.load() == tb->seq_end.load());
+    assert((tb->seq_begin.load() & 1u) == 0); // Must be even (completed)
     assert(std::abs(tb->audio_norm - 0.75f) < 0.001f);
     assert(std::abs(tb->audio_db - -6.0f) < 0.001f);
 
     // While write_begin is in progress, sequence must be odd
     commix_telemetry_write_begin();
-    assert(tb->seq_begin & 1u);
-    assert(tb->seq_end & 1u); // Both begin and end must be odd during transaction
+    assert(tb->seq_begin.load() & 1u);
+    assert(tb->seq_end.load() & 1u); // Both begin and end must be odd during transaction
     commix_telemetry_write_end();
-    assert((tb->seq_begin & 1u) == 0);
-    assert(tb->seq_begin == tb->seq_end);
-    std::cout << "  [PASS] Telemetry seqlock concurrency contract." << std::endl;
+    assert((tb->seq_begin.load() & 1u) == 0);
+    assert(tb->seq_begin.load() == tb->seq_end.load());
+
+    // Concurrent reader/writer stress test:
+    // Hammer buffer with high-frequency writes while reader validates seqlock contract
+    std::atomic<bool> stopStress{false};
+    std::atomic<size_t> tornReads{0};
+    std::atomic<size_t> validReads{0};
+
+    std::thread writerThread([&]() {
+        for (int i = 0; i < 5000 && !stopStress.load(std::memory_order_relaxed); ++i) {
+            float val = static_cast<float>(i);
+            commix_write_audio(val, val, val, val);
+        }
+    });
+
+    std::thread readerThread([&]() {
+        auto* buf = commix_get_telemetry_buffer();
+        for (int i = 0; i < 5000; ++i) {
+            uint32_t s1 = buf->seq_begin.load(std::memory_order_acquire);
+            uint32_t e1 = buf->seq_end.load(std::memory_order_acquire);
+            if ((s1 & 1u) || (s1 != e1)) continue; // In-flight write rejected correctly
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+
+            float n = buf->audio_norm;
+            float db = buf->audio_db;
+            float l = buf->audio_left_db;
+            float r = buf->audio_right_db;
+
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            uint32_t s2 = buf->seq_begin.load(std::memory_order_acquire);
+            uint32_t e2 = buf->seq_end.load(std::memory_order_acquire);
+            if (s1 != s2 || s1 != e2) continue; // Torn read rejected correctly
+
+            // If accepted, all 4 fields MUST match because writer wrote identical floats
+            if (n != db || n != l || n != r) {
+                tornReads.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                validReads.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    writerThread.join();
+    stopStress.store(true);
+    readerThread.join();
+
+    assert(tornReads.load() == 0); // Must be strictly ZERO accepted torn reads
+    assert(validReads.load() > 0);  // Must have successfully read valid frames
+    std::cout << "  [PASS] Telemetry seqlock concurrency contract (" << validReads.load() << " valid reads, 0 torn reads)." << std::endl;
+}
+
+void test_best_shot_engine() {
+    std::cout << "[RUN] test_best_shot_engine..." << std::endl;
+    BestShotEngine engine;
+
+    // 1. Without velocity history, stability is capped at 50% and trigger can never fire
+    auto s0 = engine.evaluate(nullptr, 50.0f, 0.0f, 0.0f);
+    assert(s0.stabilityScore == 50.0f);
+    assert(!s0.shouldTriggerShoot);
+
+    // 2. Severe shake camera (large angular velocities) -> stability drops to 0%
+    for (int i = 0; i < 10; ++i) {
+        engine.pushVelocity(0.5f, 0.5f, 0.5f);
+    }
+    auto sShaky = engine.evaluate(nullptr, 50.0f, 0.0f, 0.0f);
+    assert(sShaky.stabilityScore == 0.0f);
+    assert(!sShaky.shouldTriggerShoot);
+
+    // 3. Peak stillness (near-zero angular velocity) + good exposure + zero clipping -> trigger fires
+    for (int i = 0; i < 30; ++i) {
+        engine.pushVelocity(0.005f, 0.005f, 0.005f);
+    }
+    auto sStill = engine.evaluate(nullptr, 50.0f, 0.0f, 0.0f);
+    assert(sStill.stabilityScore >= 88.0f);
+    assert(sStill.totalScore >= 82.0f);
+    assert(sStill.shouldTriggerShoot);
+
+    std::cout << "  [PASS] BestShotEngine peak stillness determination & trigger contract." << std::endl;
 }
 
 int main() {
@@ -236,6 +312,7 @@ int main() {
     test_stabilization_engine();
     test_scopes_engine_neutral_and_bounds();
     test_telemetry_seqlock();
+    test_best_shot_engine();
     std::cout << "==========================================================" << std::endl;
     std::cout << " ALL NATIVE C++ ENGINE TESTS PASSED PERFECTLY!" << std::endl;
     std::cout << "==========================================================" << std::endl;

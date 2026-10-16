@@ -2,6 +2,14 @@
 #include <cstdint>
 
 #ifdef __cplusplus
+#include <atomic>
+using atomic_uint32 = std::atomic<uint32_t>;
+#else
+#include <stdatomic.h>
+typedef _Atomic uint32_t atomic_uint32;
+#endif
+
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -12,19 +20,19 @@ extern "C" {
 #define COMMIX_VSCOPE_MAX_SAMPLES 256
 
 /**
- * Shared memory layout for lock-free, zero-copy telemetry transfer from
+ * Shared memory layout for telemetry transfer from
  * Android Camera2 / AudioRecord background threads directly to Kotlin / Compose UI.
  *
- * Sequence lock (seqlock) concurrency protocol:
+ * Sequence lock (seqlock) concurrency protocol with std::atomic counters:
  * 1. Writer increments `seq_begin` to an odd number prior to writing.
  * 2. Writer copies or calculates all audio, IMU, and scope metrics.
- * 3. Writer updates `seq_end = seq_begin + 1` (even number).
- * 4. Reader checks if `seq_begin` is even; if so, reads buffer and verifies `seq_end == seq_begin`.
- *    If mismatched or odd, reader retries or uses previous valid frame.
+ * 3. Writer updates `seq_begin = odd + 1` (even number) and `seq_end = even`.
+ * 4. Reader loads `seq_begin` with acquire semantics; if even, snapshots buffer and verifies
+ *    re-read of `seq_begin == b1`. If mismatched or odd, reader rejects torn snapshot.
  */
 #pragma pack(push, 4)
 typedef struct {
-    uint32_t seq_begin;
+    atomic_uint32 seq_begin;
     uint32_t has_scopes;
 
     // Audio VU Meters
@@ -69,7 +77,7 @@ typedef struct {
     float hi_clip_pct;
     float lo_clip_pct;
 
-    uint32_t seq_end;
+    atomic_uint32 seq_end;
 } TelemetrySharedBuffer;
 #pragma pack(pop)
 

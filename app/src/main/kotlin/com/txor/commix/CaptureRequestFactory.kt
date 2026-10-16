@@ -33,7 +33,19 @@ data class CaptureRequestParams(
     val isProcessZero: Boolean = false,
     val processZeroIntensity: Float = 1.0f,
     val flashMode: String = "off", // "off", "auto", "on", "torch"
-    val isViewfinderDisabled: Boolean = false
+    val isViewfinderDisabled: Boolean = false,
+    val videoCodec: String = "hevc",
+    val nightFrameCount: Int = 8,
+    val nightAstroAlignment: Boolean = false,
+    val timeLapseIntervalSec: Int = 2,
+    val uncompressedAudio: Boolean = false,
+    val cinemaMatteRatio: String = "off",
+    val photoFormat: String = "jpeg",
+    val photoEnhanceAlgo: String = "clarity",
+    val aebEnabled: Boolean = false,
+    val aebShots: Int = 3,
+    val aebSpreadEv: Float = 1.0f,
+    val anamorphicRatio: Float = 1.0f
 )
 
 

@@ -35,6 +35,7 @@ fun RecordingHud(
     fps: Double = 30.0,
     bitrateBps: Int = 50000000,
     remainingMinutes: Int = 165,
+    showStorageRemaining: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "rec_blink")
@@ -102,14 +103,13 @@ fun RecordingHud(
                     color = Color.White
                 )
 
-                // Stereo L / R Mini VU Meters
+                // Live Audio VU Meter
                 val normDb = ((audioDb + 60f) / 60f).coerceIn(0f, 1f)
                 Column(
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                     modifier = Modifier.width(36.dp)
                 ) {
                     VuChannelBar(normDb = normDb)
-                    VuChannelBar(normDb = (normDb * 0.95f).coerceIn(0f, 1f))
                 }
             }
 
@@ -119,6 +119,7 @@ fun RecordingHud(
             val remHours = remainingMinutes / 60
             val remMins = remainingMinutes % 60
             val remLabel = if (remHours > 0) "${remHours}h ${remMins}m left" else "${remMins}m left"
+            val storageText = if (showStorageRemaining) " · $remLabel" else ""
 
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -129,7 +130,7 @@ fun RecordingHud(
                     .padding(horizontal = 8.dp, vertical = 2.dp)
             ) {
                 Text(
-                    text = "$resLabel · ${fps.toInt()}fps · ${mbps}Mbps · $remLabel",
+                    text = "$resLabel · ${fps.toInt()}fps · ${mbps}Mbps$storageText",
                     color = AppleYellow,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 10.sp,

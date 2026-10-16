@@ -15,9 +15,6 @@ object NativeTelemetryBridge {
     }
 
     @JvmStatic
-    external fun nativeGetBufferPointer(): Long
-
-    @JvmStatic
     external fun nativeWriteAudio(norm: Float, db: Float, leftDb: Float, rightDb: Float)
 
     @JvmStatic

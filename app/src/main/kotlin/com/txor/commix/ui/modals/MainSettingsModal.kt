@@ -155,7 +155,7 @@ fun MainSettingsModal(
                             SettingsSegmentedRow(
                                 title = "Still Format",
                                 subtitle = "${state.photoFormat.uppercase()} · ${state.photoQuality}%",
-                                options = listOf("jpeg" to "JPEG", "heic" to "HEIC", "raw_dng" to "RAW DNG", "webp" to "WEBP", "png" to "PNG"),
+                                options = listOf("jpeg" to "JPEG", "webp" to "WEBP", "png" to "PNG"),
                                 selected = state.photoFormat,
                                 onSelected = { viewModel.onFormatChanged(it, state.photoQuality) }
                             )
@@ -362,24 +362,10 @@ fun MainSettingsModal(
                     }
 
                     "FLAGSHIPS" -> {
-                        SettingsCard(title = "OEM Flagship & Hardware Quirks") {
-                            SettingsToggleRow(
-                                title = "MediaTek Imagiq Remosaic Pass",
-                                subtitle = "64MP Quad-Bayer full-array demosaic",
-                                checked = state.flagshipRemosaicPass,
-                                onCheckedChange = { viewModel.onToggleFlagshipRemosaic() }
-                            )
-                            Spacer(modifier = Modifier.height(10.dp))
-                            SettingsToggleRow(
-                                title = "Vendor Aux Whitelist Override",
-                                subtitle = "org.codeaurora.snapcam package whitelist",
-                                checked = state.flagshipAuxWhitelist,
-                                onCheckedChange = { viewModel.onToggleFlagshipAuxWhitelist() }
-                            )
-                            Spacer(modifier = Modifier.height(10.dp))
+                        SettingsCard(title = "Cinema Look & Color Science") {
                             SettingsSegmentedRow(
                                 title = "Color Science Profile",
-                                subtitle = "Cinema Look LUT",
+                                subtitle = "ASC CDL Grading Matrix",
                                 options = listOf("none" to "Standard", "leica" to "Leica", "hasselblad" to "Hasselblad", "zeiss" to "Zeiss", "proraw" to "Apple"),
                                 selected = state.lutLook,
                                 onSelected = { viewModel.onLutChanged(it) }

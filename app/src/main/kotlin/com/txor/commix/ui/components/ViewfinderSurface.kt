@@ -20,32 +20,53 @@ fun ViewfinderSurface(
     modifier: Modifier = Modifier,
     previewWidth: Int = 1920,
     previewHeight: Int = 1080,
+    sensorOrientation: Int = 90,
+    anamorphicDeSqueeze: Float = 1.0f,
     targetAspectRatio: Float = 3f / 4f,
     onSurfaceDestroyed: () -> Unit = {}
 ) {
+    fun buildTransform(vWidth: Int, vHeight: Int): Matrix {
+        val matrix = Matrix()
+        if (vWidth <= 0 || vHeight <= 0 || previewWidth <= 0 || previewHeight <= 0) return matrix
+        val centerX = vWidth / 2f
+        val centerY = vHeight / 2f
+
+        val isRotated = (sensorOrientation == 90 || sensorOrientation == 270)
+        val bufW = if (isRotated) previewHeight.toFloat() else previewWidth.toFloat()
+        val bufH = if (isRotated) previewWidth.toFloat() else previewHeight.toFloat()
+
+        val bufferAspect = bufW / bufH
+        val viewAspect = vWidth.toFloat() / vHeight.toFloat()
+
+        val scaleX: Float
+        val scaleY: Float
+        if (viewAspect > bufferAspect) {
+            scaleX = 1f
+            scaleY = (vWidth / bufferAspect) / vHeight
+        } else {
+            scaleX = (vHeight * bufferAspect) / vWidth
+            scaleY = 1f
+        }
+        matrix.setScale(scaleX, scaleY, centerX, centerY)
+
+        if (isRotated) {
+            matrix.postRotate(sensorOrientation.toFloat(), centerX, centerY)
+        }
+
+        if (anamorphicDeSqueeze > 1.0f) {
+            matrix.postScale(anamorphicDeSqueeze, 1.0f, centerX, centerY)
+        }
+
+        return matrix
+    }
+
     AndroidView(
         factory = { context ->
             TextureView(context).apply {
                 var lastSurface: Surface? = null
 
                 fun applyTransform(vWidth: Int, vHeight: Int) {
-                    if (vWidth <= 0 || vHeight <= 0 || previewWidth <= 0 || previewHeight <= 0) return
-                    val matrix = Matrix()
-                    // In portrait mode, 90° sensor rotation inverts aspect ratio
-                    val bufferAspect = previewHeight.toFloat() / previewWidth.toFloat()
-                    val viewAspect = vWidth.toFloat() / vHeight.toFloat()
-
-                    val scaleX: Float
-                    val scaleY: Float
-                    if (viewAspect > bufferAspect) {
-                        scaleX = 1f
-                        scaleY = (vWidth / bufferAspect) / vHeight
-                    } else {
-                        scaleX = (vHeight * bufferAspect) / vWidth
-                        scaleY = 1f
-                    }
-                    matrix.setScale(scaleX, scaleY, vWidth / 2f, vHeight / 2f)
-                    setTransform(matrix)
+                    setTransform(buildTransform(vWidth, vHeight))
                 }
 
                 surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -78,20 +99,7 @@ fun ViewfinderSurface(
         update = { textureView ->
             if (textureView.isAvailable && textureView.width > 0 && textureView.height > 0) {
                 textureView.surfaceTexture?.setDefaultBufferSize(previewWidth, previewHeight)
-                val matrix = Matrix()
-                val bufferAspect = previewHeight.toFloat() / previewWidth.toFloat()
-                val viewAspect = textureView.width.toFloat() / textureView.height.toFloat()
-                val scaleX: Float
-                val scaleY: Float
-                if (viewAspect > bufferAspect) {
-                    scaleX = 1f
-                    scaleY = (textureView.width / bufferAspect) / textureView.height
-                } else {
-                    scaleX = (textureView.height * bufferAspect) / textureView.width
-                    scaleY = 1f
-                }
-                matrix.setScale(scaleX, scaleY, textureView.width / 2f, textureView.height / 2f)
-                textureView.setTransform(matrix)
+                textureView.setTransform(buildTransform(textureView.width, textureView.height))
             }
         },
         modifier = modifier.fillMaxSize()

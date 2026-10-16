@@ -104,8 +104,8 @@ object LensProbeService {
     }
 
     /**
-     * Multi-threaded camera ID spammer scanning from -10000 to 10000 on background threads.
-     * Guaranteed never to block the main thread or cause frame drops.
+     * Scans bounded candidate OEM auxiliary camera IDs (0..128 and vendor aux ranges)
+     * on background threads without blocking camera session startup.
      */
     fun startBackgroundIdSpam(
         manager: CameraManager,
@@ -215,23 +215,25 @@ object LensProbeService {
                 "com.samsung.android.scaler.availableStreamConfigurations",
                 "com.mediatek.scaler.availableStreamConfigurations"
             )
-            for (keyName in superResKeys) {
-                try {
-                    val key = CameraCharacteristics.Key<IntArray>(keyName, IntArray::class.java)
-                    val arr = c.get(key)
-                    if (arr != null) {
-                        var i = 0
-                        while (i + 3 < arr.size) {
-                            val fmt = arr[i]
-                            val w = arr[i + 1]
-                            val h = arr[i + 2]
-                            if (w > 0 && h > 0 && (fmt == 33 || fmt == 35 || fmt == 256 || fmt == 0x21 || fmt == 0x23)) {
-                                allJpegSizes.add(Size(w, h))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                for (keyName in superResKeys) {
+                    try {
+                        val key = CameraCharacteristics.Key<IntArray>(keyName, IntArray::class.java)
+                        val arr = c.get(key)
+                        if (arr != null) {
+                            var i = 0
+                            while (i + 3 < arr.size) {
+                                val fmt = arr[i]
+                                val w = arr[i + 1]
+                                val h = arr[i + 2]
+                                if (w > 0 && h > 0 && (fmt == 33 || fmt == 35 || fmt == 256 || fmt == 0x21 || fmt == 0x23)) {
+                                    allJpegSizes.add(Size(w, h))
+                                }
+                                i += 4
                             }
-                            i += 4
                         }
-                    }
-                } catch (_: Throwable) {}
+                    } catch (_: Throwable) {}
+                }
             }
 
             // Dynamically scan all available characteristics keys for superresolution / remosaic configurations

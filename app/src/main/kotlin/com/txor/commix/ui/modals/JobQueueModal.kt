@@ -194,7 +194,16 @@ fun JobQueueModal(
                         queue.enqueueJob(
                             title = "Engine Demo: Virtual Gimbal 60fps Stack",
                             type = ProcessingJobType.VIDEO_STABILIZATION,
-                            priority = JobPriority.HIGH
+                            priority = JobPriority.HIGH,
+                            executionBlock = { updateProgress ->
+                                updateProgress(0.25f, "Parsing Gyroflow IMU log")
+                                kotlinx.coroutines.delay(200)
+                                updateProgress(0.60f, "Running Kalman attitude filter")
+                                kotlinx.coroutines.delay(200)
+                                updateProgress(0.90f, "Applying quaternion smoothing")
+                                kotlinx.coroutines.delay(200)
+                                updateProgress(1.0f, "Completed")
+                            }
                         )
                     }
                     .padding(vertical = 8.dp)

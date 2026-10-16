@@ -217,55 +217,6 @@ class KeyframeEngineAndAutomationTest {
         assertEquals(1.0f, vEnd.ev!!, 0.001f)
     }
 
-    // --- Best Shot Scoring Algorithm Verification ---
-
-    private fun computeBestShotScore(
-        avgGyroVel: Float,
-        spotIre: Float,
-        hiClipPct: Float,
-        loClipPct: Float
-    ): Triple<Float, Float, Float> {
-        val stabNorm = ((0.40f - avgGyroVel) / (0.40f - 0.02f)).coerceIn(0f, 1f)
-        val stabilityScore = stabNorm * 100f
-
-        val spotDiff = abs(spotIre - 50.0f)
-        val expNorm = (1.0f - (spotDiff / 40.0f)).coerceIn(0f, 1f)
-        val exposureScore = expNorm * 100f
-
-        val clipTotal = hiClipPct + loClipPct
-        val drNorm = (1.0f - (clipTotal / 25.0f)).coerceIn(0f, 1f)
-        val dynamicRangeScore = drNorm * 100f
-
-        return Triple(stabilityScore, exposureScore, dynamicRangeScore)
-    }
-
-    @Test
-    fun testBestShotPeakStillnessProducesHighScore() {
-        val (stability, exposure, dr) = computeBestShotScore(
-            avgGyroVel = 0.01f, // Still
-            spotIre = 50f,      // Perfect exposure
-            hiClipPct = 0f,     // No clipping
-            loClipPct = 0f
-        )
-        assertEquals(100f, stability, 0.1f)
-        assertEquals(100f, exposure, 0.1f)
-        assertEquals(100f, dr, 0.1f)
-
-        val total = 0.50f * stability + 0.30f * exposure + 0.20f * dr
-        assertEquals(100f, total, 0.1f)
-        assertTrue(total >= 82.0f && stability >= 88.0f)
-    }
-
-    @Test
-    fun testBestShotRejectsShakyCamera() {
-        val (stability, _, _) = computeBestShotScore(
-            avgGyroVel = 0.50f, // Severe shake
-            spotIre = 50f,
-            hiClipPct = 0f,
-            loClipPct = 0f
-        )
-        assertEquals(0f, stability, 0.1f)
-    }
 
     @Test
     fun testAll16ProControlTabsExist() {

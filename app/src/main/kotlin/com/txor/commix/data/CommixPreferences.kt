@@ -58,8 +58,6 @@ class CommixPreferences(context: Context) {
         private const val KEY_NIGHT_TONE = "nightTone"
         private const val KEY_SLOW_MO_FPS = "slowMoFps"
         private const val KEY_TIMELAPSE_INTERVAL = "timeLapseIntervalSec"
-        private const val KEY_FLAGSHIP_REMOSAIC = "flagshipRemosaicPass"
-        private const val KEY_FLAGSHIP_AUX_WHITELIST = "flagshipAuxWhitelist"
         private const val KEY_AUTOMATION_TRIGGER = "automationTriggerMode"
         private const val KEY_QUEUE_THREADS = "queueWorkerThreads"
         private const val KEY_QUEUE_AUTO_STACKING = "queueAutoQueueStacking"
@@ -108,8 +106,6 @@ class CommixPreferences(context: Context) {
             nightTone = prefs.getString(KEY_NIGHT_TONE, defaultState.nightTone) ?: defaultState.nightTone,
             slowMoFps = prefs.getInt(KEY_SLOW_MO_FPS, defaultState.slowMoFps),
             timeLapseIntervalSec = prefs.getInt(KEY_TIMELAPSE_INTERVAL, defaultState.timeLapseIntervalSec),
-            flagshipRemosaicPass = prefs.getBoolean(KEY_FLAGSHIP_REMOSAIC, defaultState.flagshipRemosaicPass),
-            flagshipAuxWhitelist = prefs.getBoolean(KEY_FLAGSHIP_AUX_WHITELIST, defaultState.flagshipAuxWhitelist),
             automationTriggerMode = prefs.getString(KEY_AUTOMATION_TRIGGER, defaultState.automationTriggerMode) ?: defaultState.automationTriggerMode,
             queueWorkerThreads = prefs.getInt(KEY_QUEUE_THREADS, defaultState.queueWorkerThreads),
             queueAutoQueueStacking = prefs.getBoolean(KEY_QUEUE_AUTO_STACKING, defaultState.queueAutoQueueStacking)
@@ -158,8 +154,6 @@ class CommixPreferences(context: Context) {
             .putString(KEY_NIGHT_TONE, state.nightTone)
             .putInt(KEY_SLOW_MO_FPS, state.slowMoFps)
             .putInt(KEY_TIMELAPSE_INTERVAL, state.timeLapseIntervalSec)
-            .putBoolean(KEY_FLAGSHIP_REMOSAIC, state.flagshipRemosaicPass)
-            .putBoolean(KEY_FLAGSHIP_AUX_WHITELIST, state.flagshipAuxWhitelist)
             .putString(KEY_AUTOMATION_TRIGGER, state.automationTriggerMode)
             .putInt(KEY_QUEUE_THREADS, state.queueWorkerThreads)
             .putBoolean(KEY_QUEUE_AUTO_STACKING, state.queueAutoQueueStacking)

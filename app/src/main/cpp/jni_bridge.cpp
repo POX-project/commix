@@ -36,9 +36,6 @@ static inline bool validateDirectBuffer(JNIEnv* env, jobject buf, size_t require
 // NativeTelemetryBridge Methods
 // ============================================================================
 
-static jlong JNICALL native_get_buffer_pointer(JNIEnv* /*env*/, jclass /*clazz*/) {
-    return reinterpret_cast<jlong>(commix_get_telemetry_buffer());
-}
 
 static void JNICALL native_write_audio(
     JNIEnv* /*env*/, jclass /*clazz*/,
@@ -52,9 +49,6 @@ static void JNICALL native_write_imu(
     jfloat pitch, jfloat roll, jfloat yaw
 ) {
     commix_write_imu(pitch, roll, yaw);
-    commix::StabilizationEngine::instance().pushImuSample(
-        0, 0.f, 0.f, 0.f, pitch, roll, yaw
-    );
 }
 
 static void JNICALL native_write_lens(
@@ -88,23 +82,47 @@ static void JNICALL native_compute_scopes_direct(
     auto* tb = commix_get_telemetry_buffer();
     if (!tb) return;
 
-    commix_telemetry_write_begin();
+    thread_local int32_t local_luma[COMMIX_HIST_BINS];
+    thread_local int32_t local_r[COMMIX_HIST_BINS];
+    thread_local int32_t local_g[COMMIX_HIST_BINS];
+    thread_local int32_t local_b[COMMIX_HIST_BINS];
+    thread_local float local_wave_avg[COMMIX_WAVE_COLS];
+    thread_local float local_wave_min[COMMIX_WAVE_COLS];
+    thread_local float local_wave_max[COMMIX_WAVE_COLS];
+    thread_local float local_parade_r[COMMIX_PARADE_N];
+    thread_local float local_parade_g[COMMIX_PARADE_N];
+    thread_local float local_parade_b[COMMIX_PARADE_N];
+    thread_local float local_vscope[COMMIX_VSCOPE_MAX_SAMPLES * 2];
 
     commix::ScopeOut out;
-    out.luma = tb->luma_bins;
-    out.rBins = tb->r_bins;
-    out.gBins = tb->g_bins;
-    out.bBins = tb->b_bins;
-    out.waveAvg = tb->wave_cols_avg;
-    out.waveMin = tb->wave_cols_min;
-    out.waveMax = tb->wave_cols_max;
-    out.paradeR = tb->parade_r;
-    out.paradeG = tb->parade_g;
-    out.paradeB = tb->parade_b;
-    out.vscope = tb->vscope_samples;
+    out.luma = local_luma;
+    out.rBins = local_r;
+    out.gBins = local_g;
+    out.bBins = local_b;
+    out.waveAvg = local_wave_avg;
+    out.waveMin = local_wave_min;
+    out.waveMax = local_wave_max;
+    out.paradeR = local_parade_r;
+    out.paradeG = local_parade_g;
+    out.paradeB = local_parade_b;
+    out.vscope = local_vscope;
 
+    // 1. Heavy image scan is computed completely lock-free in thread-local memory
     commix::compute_scopes(y, u, v, width, height, y_stride, uv_stride, uv_pixel_stride, step, out);
 
+    // 2. High-speed sub-microsecond atomic commit to shared telemetry buffer
+    commix_telemetry_write_begin();
+    std::memcpy(tb->luma_bins, local_luma, sizeof(local_luma));
+    std::memcpy(tb->r_bins, local_r, sizeof(local_r));
+    std::memcpy(tb->g_bins, local_g, sizeof(local_g));
+    std::memcpy(tb->b_bins, local_b, sizeof(local_b));
+    std::memcpy(tb->wave_cols_avg, local_wave_avg, sizeof(local_wave_avg));
+    std::memcpy(tb->wave_cols_min, local_wave_min, sizeof(local_wave_min));
+    std::memcpy(tb->wave_cols_max, local_wave_max, sizeof(local_wave_max));
+    std::memcpy(tb->parade_r, local_parade_r, sizeof(local_parade_r));
+    std::memcpy(tb->parade_g, local_parade_g, sizeof(local_parade_g));
+    std::memcpy(tb->parade_b, local_parade_b, sizeof(local_parade_b));
+    std::memcpy(tb->vscope_samples, local_vscope, sizeof(local_vscope));
     tb->spot_ire = out.spotIre;
     tb->mean_u = out.meanU;
     tb->mean_v = out.meanV;
@@ -112,7 +130,6 @@ static void JNICALL native_compute_scopes_direct(
     tb->lo_clip_pct = out.loClipPct;
     tb->vscope_count = out.vscopeCount;
     tb->has_scopes = 1;
-
     commix_telemetry_write_end();
 }
 
@@ -123,9 +140,10 @@ static jboolean JNICALL native_read_telemetry(
     auto* tb = commix_get_telemetry_buffer();
     if (!tb) return JNI_FALSE;
 
-    uint32_t b1 = tb->seq_begin;
-    if (b1 & 1u) return JNI_FALSE; // Writer active
-    std::atomic_thread_fence(std::memory_order_acquire);
+    uint32_t b1 = tb->seq_begin.load(std::memory_order_acquire);
+    uint32_t e1 = tb->seq_end.load(std::memory_order_acquire);
+    if ((b1 & 1u) || (b1 != e1)) return JNI_FALSE; // Writer active
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 
     // Snapshot fields to local stack memory
     jfloat f[10] = {
@@ -142,9 +160,10 @@ static jboolean JNICALL native_read_telemetry(
         std::memcpy(waveSnapshot, tb->wave_cols_avg, sizeof(waveSnapshot));
     }
 
-    std::atomic_thread_fence(std::memory_order_acquire);
-    uint32_t b2 = tb->seq_end;
-    if (b1 != b2) return JNI_FALSE; // Frame torn during read
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    uint32_t b2 = tb->seq_begin.load(std::memory_order_acquire);
+    uint32_t e2 = tb->seq_end.load(std::memory_order_acquire);
+    if (b1 != b2 || b1 != e2) return JNI_FALSE; // Frame torn during read (writer started or finished during snapshot)
 
     // Safely commit local snapshot to JVM arrays
     if (outFloats && env->GetArrayLength(outFloats) >= 10) {
@@ -249,25 +268,6 @@ static jboolean JNICALL native_stop_and_export_gyroflow(
     return success ? JNI_TRUE : JNI_FALSE;
 }
 
-static void JNICALL native_compute_l1_path(
-    JNIEnv* env, jclass /*clazz*/,
-    jfloatArray inputTraj, jfloatArray outputTraj, jint count, jfloat lambda
-) {
-    if (!inputTraj || !outputTraj || count <= 0) return;
-    if (env->GetArrayLength(inputTraj) < count || env->GetArrayLength(outputTraj) < count) return;
-
-    jfloat* inPtr = env->GetFloatArrayElements(inputTraj, nullptr);
-    jfloat* outPtr = env->GetFloatArrayElements(outputTraj, nullptr);
-
-    if (inPtr && outPtr) {
-        commix::StabilizationEngine::computeL1Path(inPtr, outPtr, count, lambda);
-        env->ReleaseFloatArrayElements(inputTraj, inPtr, JNI_ABORT);
-        env->ReleaseFloatArrayElements(outputTraj, outPtr, 0);
-    } else {
-        if (inPtr) env->ReleaseFloatArrayElements(inputTraj, inPtr, JNI_ABORT);
-        if (outPtr) env->ReleaseFloatArrayElements(outputTraj, outPtr, JNI_ABORT);
-    }
-}
 
 static void JNICALL native_push_best_shot_velocity(
     JNIEnv* /*env*/, jclass /*clazz*/,
@@ -394,7 +394,6 @@ static jboolean JNICALL native_keyframe_tick(
 // ============================================================================
 
 static const JNINativeMethod g_telemetry_methods[] = {
-    {(char*)"nativeGetBufferPointer", (char*)"()J", (void*)native_get_buffer_pointer},
     {(char*)"nativeWriteAudio", (char*)"(FFFF)V", (void*)native_write_audio},
     {(char*)"nativeWriteImu", (char*)"(FFF)V", (void*)native_write_imu},
     {(char*)"nativeWriteLens", (char*)"(FI)V", (void*)native_write_lens},
@@ -409,7 +408,6 @@ static const JNINativeMethod g_engine_methods[] = {
     {(char*)"nativeApplyCdlDirect", (char*)"(Ljava/nio/ByteBuffer;IIIFFFFFFFFFF)V", (void*)native_apply_cdl_direct},
     {(char*)"nativeStartImuLogging", (char*)"()V", (void*)native_start_imu_logging},
     {(char*)"nativeStopAndExportGyroflow", (char*)"(Ljava/lang/String;Ljava/lang/String;D)Z", (void*)native_stop_and_export_gyroflow},
-    {(char*)"nativeComputeL1Path", (char*)"([F[FIF)V", (void*)native_compute_l1_path},
     {(char*)"nativePushBestShotVelocity", (char*)"(FFF)V", (void*)native_push_best_shot_velocity},
     {(char*)"nativeEvaluateBestShot", (char*)"(FFF[F)Z", (void*)native_evaluate_best_shot},
     {(char*)"nativeStackFramesDirect", (char*)"([Ljava/nio/ByteBuffer;IIIILjava/nio/ByteBuffer;Z)Z", (void*)native_stack_frames_direct},

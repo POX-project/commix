@@ -136,7 +136,7 @@ fun HardwareLensModal(
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (isProbing) "Spamming IDs -10000..10000..." else "⚡ Spam & Probe All Camera IDs (-10000..10000)",
+                        text = if (isProbing) "Probing candidate IDs 0..128..." else "⚡ Probe All Camera IDs (0..128)",
                         color = AppleYellow,
                         fontWeight = FontWeight.Bold,
                         fontSize = 12.5.sp

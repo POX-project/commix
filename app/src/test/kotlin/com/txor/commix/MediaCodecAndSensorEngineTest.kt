@@ -11,22 +11,23 @@ class MediaCodecAndSensorEngineTest {
     @Test
     fun testAudioDbAndRmsCalculation() {
         val maxRms = 32767.0
-        val maxDb = 20.0 * log10(maxRms / 32768.0)
+        val maxDb = AudioEngine.calculateDb(maxRms)
         assertEquals(0.0, maxDb, 0.05)
 
         val halfRms = 16384.0
-        val halfDb = 20.0 * log10(halfRms / 32768.0)
+        val halfDb = AudioEngine.calculateDb(halfRms)
         assertEquals(-6.02, halfDb, 0.05)
 
-        val normDb = ((halfDb + 60.0) / 60.0).coerceIn(0.0, 1.0)
+        val normDb = AudioEngine.calculateNorm(halfDb)
         assertTrue(normDb in 0.89..0.91)
     }
 
     @Test
     fun testAudioNormalizationClampsNegativeInfinity() {
         val silentRms = 0.0
-        val silentDb = if (silentRms > 0.0) 20.0 * log10(silentRms / 32768.0) else -96.0
-        val norm = ((silentDb + 60.0) / 60.0).coerceIn(0.0, 1.0)
+        val silentDb = AudioEngine.calculateDb(silentRms)
+        assertEquals(-96.0, silentDb, 0.001)
+        val norm = AudioEngine.calculateNorm(silentDb)
         assertEquals(0.0, norm, 0.001)
     }
 
@@ -56,22 +57,8 @@ class MediaCodecAndSensorEngineTest {
         val tempFile = File.createTempFile("gyroflow_test", ".gcsv")
         tempFile.deleteOnExit()
 
-        // Test export without requiring android Context
-        tempFile.bufferedWriter().use { writer ->
-            writer.write("GYROFLOW V1\n")
-            writer.write("t,gx,gy,gz,ax,ay,az\n")
-            val baseTs = if (samples.isNotEmpty()) samples.first().timestampNs else 0L
-            for (s in samples) {
-                val relTimeMs = (s.timestampNs - baseTs) / 1_000_000.0
-                writer.write(
-                    String.format(
-                        java.util.Locale.US,
-                        "%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                        relTimeMs, s.gyroX, s.gyroY, s.gyroZ, s.accelX, s.accelY, s.accelZ
-                    )
-                )
-            }
-        }
+        // Call the production SensorHub exportGyroflowGcsv implementation
+        SensorHub.exportGyroflowGcsv(tempFile, samples)
 
         assertTrue(tempFile.exists())
         val lines = tempFile.readLines()

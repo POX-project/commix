@@ -135,3 +135,28 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
 }
+
+tasks.register<Exec>("testNative") {
+    group = "verification"
+    description = "Compiles and executes the bare-metal C++20 Aether engine verification suite."
+    workingDir = projectDir
+    commandLine(
+        "bash", "-c",
+        """
+        mkdir -p build/test-native && \
+        g++ -std=c++20 -Wall -Wextra -Werror \
+          src/test/cpp/native_engine_test.cpp \
+          src/main/cpp/computational_photo.cpp \
+          src/main/cpp/stabilization_engine.cpp \
+          src/main/cpp/scopes_engine.cpp \
+          src/main/cpp/best_shot_engine.cpp \
+          src/main/cpp/keyframe_engine.cpp \
+          src/main/cpp/commix_telemetry.cpp \
+          -lpthread -lm -o build/test-native/native_engine_test && ./build/test-native/native_engine_test
+        """.trimIndent()
+    )
+}
+
+tasks.named("check") {
+    dependsOn("testNative")
+}

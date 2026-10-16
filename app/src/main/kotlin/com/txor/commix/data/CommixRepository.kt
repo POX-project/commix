@@ -768,6 +768,13 @@ class CommixRepository(private val context: Context) {
         }
 
         try {
+            val videoMime = if (currentParams.videoCodec.equals("hevc", ignoreCase = true) ||
+                                currentParams.videoCodec.equals("h265", ignoreCase = true)) {
+                android.media.MediaFormat.MIMETYPE_VIDEO_HEVC
+            } else {
+                android.media.MediaFormat.MIMETYPE_VIDEO_AVC
+            }
+
             val recorder = CommixRecordingEngine(
                 outputFile = vidFile,
                 width = bestCamSize.width,
@@ -775,13 +782,17 @@ class CommixRepository(private val context: Context) {
                 targetFps = targetFpsFloat,
                 bitrateBps = bitrate,
                 isSlowMotion = isSlowMotion,
-                playbackFps = playbackFps
+                playbackFps = playbackFps,
+                mimeType = videoMime
             )
             recorder.start()
             val recSurface = recorder.surface ?: throw IllegalStateException("Encoder surface is null")
             videoRecorder = recorder
             activeRecordingFps = targetFpsFloat
             isRecordingVideo = true
+
+            // Start hardware gyro/accel logging for genuine Gyroflow export
+            sensorHub.startImuLogging()
 
             val soloPass = isVfDisabled || currentParams.isViewfinderDisabled
             val recordSurfaces = if (soloPass) {
@@ -902,27 +913,40 @@ class CommixRepository(private val context: Context) {
         val camera = sessionManager.activeDevice
         val pSurf = previewSurface
         val vidFile = activeVideoFile
-
-        try {
-            videoRecorder?.stop()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping video recorder: ${e.message}")
-        }
+        val activeFps = activeRecordingFps
+        val activeCamId = sessionManager.activeCameraId ?: "0"
+        val recorder = videoRecorder
         videoRecorder = null
 
-        if (vidFile != null) {
-            val csvFile = File(vidFile.parentFile, vidFile.nameWithoutExtension + ".gcsv")
+        // Stop real hardware IMU logging
+        val imuSamples = sensorHub.stopImuLogging()
+
+        // Move heavy muxer finalization, Gyroflow export, and MediaStore storage to background I/O
+        ioScope.launch {
             try {
-                NativeEngineBridge.nativeStopAndExportGyroflow(
-                    csvFile.absolutePath,
-                    sessionManager.activeCameraId ?: "0",
-                    activeRecordingFps
-                )
+                recorder?.stop()
             } catch (e: Exception) {
-                Log.w(TAG, "Gyroflow export error: ${e.message}")
+                Log.e(TAG, "Error stopping video recorder: ${e.message}")
             }
 
-            saveVideoToMediaStore(vidFile)
+            if (vidFile != null && vidFile.exists()) {
+                val csvFile = File(vidFile.parentFile, vidFile.nameWithoutExtension + ".gcsv")
+                try {
+                    if (imuSamples.isNotEmpty()) {
+                        sensorHub.exportGyroflowGcsv(csvFile, imuSamples)
+                    } else {
+                        NativeEngineBridge.nativeStopAndExportGyroflow(
+                            csvFile.absolutePath,
+                            activeCamId,
+                            activeFps
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Gyroflow export error: ${e.message}")
+                }
+
+                saveVideoToMediaStore(vidFile)
+            }
         }
 
         if (camera != null && pSurf != null) {
@@ -957,11 +981,18 @@ class CommixRepository(private val context: Context) {
                     type = ProcessingJobType.VIDEO_STABILIZATION,
                     sourcePath = file.absolutePath,
                     outputPath = file.name,
-                    priority = JobPriority.HIGH
+                    priority = JobPriority.HIGH,
+                    executionBlock = { updateProgress ->
+                        updateProgress(0.5f, "Writing MediaStore records")
+                        updateProgress(1.0f, "Completed")
+                    }
                 )
                 onVideoSaved?.invoke(uri)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed writing video to MediaStore", e)
+            } finally {
+                // Delete temporary video recording file once stored in MediaStore
+                try { file.delete() } catch (_: Exception) {}
             }
         }
     }
@@ -977,6 +1008,12 @@ class CommixRepository(private val context: Context) {
             onError?.invoke("Camera not ready for capture")
             return
         }
+
+        if (currentParams.aebEnabled) {
+            takeAebBurst(metadata)
+            return
+        }
+
         sessionManager.transitionTo(CameraState.CAPTURING_STILL)
 
         try {
@@ -1010,6 +1047,61 @@ class CommixRepository(private val context: Context) {
             Log.e(TAG, "Exception during takePicture: ${e.message}")
             sessionManager.transitionTo(CameraState.ACTIVE_PREVIEW)
             onError?.invoke("Exception during takePicture: ${e.message}")
+        }
+    }
+
+    private fun takeAebBurst(metadata: ShotMetadata) {
+        val session = sessionManager.activeSession ?: return
+        val device = sessionManager.activeDevice ?: return
+        val reader = stillReader ?: return
+        val handler = cameraHandler ?: return
+        if (!reader.surface.isValid || sessionManager.state != CameraState.ACTIVE_PREVIEW) return
+
+        sessionManager.transitionTo(CameraState.CAPTURING_STILL)
+        val sensorOrientation = activeCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val shots = currentParams.aebShots.coerceIn(3, 5)
+        val spread = currentParams.aebSpreadEv.coerceIn(0.5f, 2.0f)
+        val step = currentParams.evStep.takeIf { it > 0f } ?: 0.1f
+
+        val offsets = if (shots == 3) {
+            listOf(-spread, 0.0f, spread)
+        } else {
+            listOf(-spread, -spread / 2f, 0.0f, spread / 2f, spread)
+        }
+
+        val requests = offsets.map { offsetEv ->
+            device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(reader.surface)
+                CaptureRequestFactory.applyControls(this, currentParams)
+                val targetEvIndex = ((currentParams.evStops + offsetEv) / step).toInt()
+                set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, targetEvIndex)
+                set(CaptureRequest.JPEG_QUALITY, metadata.compressionQuality.toByte())
+                set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
+            }.build()
+        }
+
+        try {
+            session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureSequenceCompleted(
+                    session: CameraCaptureSession,
+                    sequenceId: Int,
+                    frameNumber: Long
+                ) {
+                    sessionManager.transitionTo(CameraState.ACTIVE_PREVIEW)
+                }
+
+                override fun onCaptureFailed(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    failure: CaptureFailure
+                ) {
+                    sessionManager.transitionTo(CameraState.ACTIVE_PREVIEW)
+                    onError?.invoke("AEB burst capture failed: ${failure.reason}")
+                }
+            }, handler)
+        } catch (e: Exception) {
+            Log.e(TAG, "AEB capture error: ${e.message}")
+            sessionManager.transitionTo(CameraState.ACTIVE_PREVIEW)
         }
     }
 
@@ -1076,7 +1168,7 @@ class CommixRepository(private val context: Context) {
         synchronized(nightBurstCollector) { nightBurstCollector.clear() }
 
         val sensorOrientation = activeCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        val burstCount = 6
+        val burstCount = currentParams.nightFrameCount.coerceIn(3, 16)
         val burstRequests = mutableListOf<CaptureRequest>()
         for (i in 0 until burstCount) {
             val req = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
@@ -1213,8 +1305,12 @@ class CommixRepository(private val context: Context) {
     private fun processToneAndGrain(jpegBytes: ByteArray): ByteArray {
         val curve = currentParams.toneCurve
         val grain = currentParams.filmGrain
-        if (curve == "neutral" && grain == "off") return jpegBytes
-        if (!NativeEngineBridge.isLoaded) return jpegBytes
+        val lut = currentParams.lutLook
+        val enhance = currentParams.photoEnhanceAlgo
+        val isNonDefaultFormat = currentParams.photoFormat.lowercase() != "jpeg" && currentParams.photoFormat.lowercase() != "jpg"
+        val needsProcessing = (curve != "neutral" || grain != "off" || (lut.isNotEmpty() && lut != "none") || enhance == "clarity" || enhance == "unsharp" || isNonDefaultFormat)
+        if (!needsProcessing) return jpegBytes
+        if (!NativeEngineBridge.isLoaded && !isNonDefaultFormat) return jpegBytes
 
         try {
             val opts = BitmapFactory.Options().apply { inMutable = true }
@@ -1222,30 +1318,81 @@ class CommixRepository(private val context: Context) {
             val w = mutableBmp.width
             val h = mutableBmp.height
 
-            val directBuf = ByteBuffer.allocateDirect(w * h * 4)
-            mutableBmp.copyPixelsToBuffer(directBuf)
-            directBuf.rewind()
+            if (NativeEngineBridge.isLoaded) {
+                val directBuf = ByteBuffer.allocateDirect(w * h * 4)
+                mutableBmp.copyPixelsToBuffer(directBuf)
+                directBuf.rewind()
 
-            val curveId = when (curve) {
-                "linear" -> 0
-                "film_print" -> 1
-                "cine_d" -> 2
-                "neutral" -> 3
-                else -> 3
-            }
-            val grainId = when (grain) {
-                "35mm" -> 1
-                "16mm" -> 2
-                "8mm" -> 3
-                else -> 0
-            }
+                // 1. Process Zero Tone Curve & Analog Film Grain
+                if (curve != "neutral" || grain != "off") {
+                    val curveId = when (curve) {
+                        "linear" -> 0
+                        "film_print" -> 1
+                        "cine_d" -> 2
+                        "neutral" -> 3
+                        else -> 3
+                    }
+                    val grainId = when (grain) {
+                        "35mm" -> 1
+                        "16mm" -> 2
+                        "8mm" -> 3
+                        else -> 0
+                    }
+                    NativeEngineBridge.nativeProcessZeroDirect(directBuf, w, h, 4, curveId, grainId, 1.0f)
+                    directBuf.rewind()
+                }
 
-            NativeEngineBridge.nativeProcessZeroDirect(directBuf, w, h, 4, curveId, grainId, 1.0f)
-            directBuf.rewind()
-            mutableBmp.copyPixelsFromBuffer(directBuf)
+                // 2. ASC CDL Cinema Look Color Grading
+                if (lut.isNotEmpty() && lut != "none") {
+                    when (lut.lowercase()) {
+                        "leica" -> NativeEngineBridge.nativeApplyCdlDirect(
+                            directBuf, w, h, 4,
+                            1.15f, 1.15f, 1.15f,
+                            -0.02f, -0.02f, -0.02f,
+                            1.05f, 1.05f, 1.05f,
+                            0.95f
+                        )
+                        "hasselblad" -> NativeEngineBridge.nativeApplyCdlDirect(
+                            directBuf, w, h, 4,
+                            1.0f, 1.02f, 0.98f,
+                            0.0f, 0.0f, 0.0f,
+                            1.0f, 1.0f, 1.0f,
+                            1.05f
+                        )
+                        "zeiss" -> NativeEngineBridge.nativeApplyCdlDirect(
+                            directBuf, w, h, 4,
+                            0.95f, 1.0f, 1.1f,
+                            -0.01f, 0.0f, 0.02f,
+                            1.02f, 1.02f, 1.05f,
+                            1.1f
+                        )
+                        "proraw" -> NativeEngineBridge.nativeApplyCdlDirect(
+                            directBuf, w, h, 4,
+                            1.05f, 1.05f, 1.05f,
+                            0.01f, 0.01f, 0.01f,
+                            0.95f, 0.95f, 0.95f,
+                            1.15f
+                        )
+                    }
+                    directBuf.rewind()
+                }
+
+                // 3. Unsharp Mask Clarity Enhancement
+                if (enhance == "clarity" || enhance == "unsharp") {
+                    NativeEngineBridge.nativeApplyUnsharpMaskDirect(directBuf, w, h, 4, 1.5f, 0.6f)
+                    directBuf.rewind()
+                }
+
+                mutableBmp.copyPixelsFromBuffer(directBuf)
+            }
 
             val stream = ByteArrayOutputStream()
-            mutableBmp.compress(Bitmap.CompressFormat.JPEG, 95, stream)
+            val format = when (currentParams.photoFormat.lowercase()) {
+                "png" -> Bitmap.CompressFormat.PNG
+                "webp" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
+                else -> Bitmap.CompressFormat.JPEG
+            }
+            mutableBmp.compress(format, 95, stream)
             mutableBmp.recycle()
             return stream.toByteArray()
         } catch (t: Throwable) {
@@ -1257,26 +1404,38 @@ class CommixRepository(private val context: Context) {
     private fun saveStillBytes(bytes: ByteArray, isNight: Boolean = false) {
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val prefix = if (isNight) "COMMIX_NIGHT_" else "COMMIX_"
-        val fileName = "$prefix$timeStamp.jpg"
+        val ext = when (currentParams.photoFormat.lowercase()) {
+            "png" -> ".png"
+            "webp" -> ".webp"
+            else -> ".jpg"
+        }
+        val mime = when (currentParams.photoFormat.lowercase()) {
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            else -> "image/jpeg"
+        }
+        val fileName = "$prefix$timeStamp$ext"
 
         val tempFile = File(context.cacheDir, "temp_$fileName")
         try {
             tempFile.writeBytes(bytes)
-            val orientation = activeCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-            val meta = ShotMetadata(
-                timestamp = System.currentTimeMillis(),
-                iso = currentParams.iso.takeIf { it > 0 },
-                exposureTimeNs = currentParams.expNs.takeIf { it > 0L },
-                activeMode = currentParams.activeMode
-            )
-            ExifWriter.writeMetadata(tempFile, orientation, meta, exifOptions)
+            if (ext == ".jpg") {
+                val orientation = activeCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                val meta = ShotMetadata(
+                    timestamp = System.currentTimeMillis(),
+                    iso = currentParams.iso.takeIf { it > 0 },
+                    exposureTimeNs = currentParams.expNs.takeIf { it > 0L },
+                    activeMode = currentParams.activeMode
+                )
+                ExifWriter.writeMetadata(tempFile, orientation, meta, exifOptions)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Failed embedding EXIF into temp file: ${e.message}")
         }
 
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.MIME_TYPE, mime)
             put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Commix")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(MediaStore.Images.Media.IS_PENDING, 1)
@@ -1305,7 +1464,11 @@ class CommixRepository(private val context: Context) {
                     title = if (isNight) "Night Burst HDR Fusion ($fileName)" else "Tone Curve & Grain Synthesis ($fileName)",
                     type = jobType,
                     outputPath = fileName,
-                    priority = JobPriority.NORMAL
+                    priority = JobPriority.NORMAL,
+                    executionBlock = { updateProgress ->
+                        updateProgress(0.5f, "Writing EXIF & MediaStore data")
+                        updateProgress(1.0f, "Completed")
+                    }
                 )
                 onPhotoSaved?.invoke(uri)
             } catch (e: Exception) {
@@ -1369,7 +1532,11 @@ class CommixRepository(private val context: Context) {
                     title = if (is360) "360° Photo Sphere Stitching ($fileName)" else "Panorama Sweep Stitching ($fileName)",
                     type = ProcessingJobType.PANORAMA_STITCHING,
                     outputPath = fileName,
-                    priority = JobPriority.HIGH
+                    priority = JobPriority.HIGH,
+                    executionBlock = { updateProgress ->
+                        updateProgress(0.5f, "Assembling panorama tiles")
+                        updateProgress(1.0f, "Completed")
+                    }
                 )
                 onPhotoSaved?.invoke(uri)
                 onSaved?.invoke(uri)

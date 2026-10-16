@@ -30,7 +30,6 @@ class MediaCodecRecorder(
     private var encoder: MediaCodec? = null
     private var inputSurface: Surface? = null
     private var mediaMuxer: MediaMuxer? = null
-    private var fmp4Muxer: Fmp4Muxer? = null
     private var videoTrackIndex: Int = -1
     private var isMuxerStarted: Boolean = false
     @Volatile private var isRecording: Boolean = false
@@ -47,14 +46,7 @@ class MediaCodecRecorder(
         if (isRecording) return
 
         outputFile.parentFile?.mkdirs()
-        mediaMuxer = try {
-            MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        } catch (_: Exception) {
-            null
-        }
-        if (mediaMuxer == null) {
-            fmp4Muxer = Fmp4Muxer(outputFile, width, height)
-        }
+        mediaMuxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
         var encWidth = width
         var encHeight = height
@@ -161,12 +153,12 @@ class MediaCodecRecorder(
                 } else if (outIdx >= 0) {
                     val outBuf = enc.getOutputBuffer(outIdx)
                     if (outBuf != null && bufferInfo.size > 0) {
-                        // Synthetic monotonic presentation timestamp generation:
-                        // Guarantees container output frame rate exactly matches target capture FPS (e.g. 960 FPS, 240 FPS)
-                        // or expanded slow-motion playback FPS (30 FPS) with 0 clock jitter.
-                        val syntheticPtsUs = frameIndex * stepUs
-                        bufferInfo.presentationTimeUs = syntheticPtsUs
-                        frameIndex++
+                        if (isSlowMotion) {
+                            // Expanded slow-motion playback: scale monotonic timestamps according to target playback FPS
+                            val syntheticPtsUs = frameIndex * stepUs
+                            bufferInfo.presentationTimeUs = syntheticPtsUs
+                            frameIndex++
+                        }
 
                         if (mediaMuxer != null && isMuxerStarted) {
                             if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
@@ -174,20 +166,6 @@ class MediaCodecRecorder(
                                 outBuf.limit(bufferInfo.offset + bufferInfo.size)
                                 mediaMuxer?.writeSampleData(videoTrackIndex, outBuf, bufferInfo)
                             }
-                        } else if (fmp4Muxer != null && (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                            outBuf.position(bufferInfo.offset)
-                            outBuf.limit(bufferInfo.offset + bufferInfo.size)
-
-                            val chunk = ByteArray(bufferInfo.size)
-                            outBuf.get(chunk)
-
-                            val isKey = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                            val fragDuration = if (isSlowMotion) {
-                                (90000.0 / playbackFps.coerceAtLeast(1.0)).toLong()
-                            } else {
-                                (90000.0 / targetFps.coerceAtLeast(1.0)).toLong()
-                            }
-                            fmp4Muxer?.writeFragment(chunk, fragDuration.coerceAtLeast(1L), isKey)
                         }
                     }
                     try {
@@ -234,9 +212,6 @@ class MediaCodecRecorder(
         }
         mediaMuxer = null
         isMuxerStarted = false
-
-        fmp4Muxer?.close()
-        fmp4Muxer = null
 
         try {
             inputSurface?.release()
