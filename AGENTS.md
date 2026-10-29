@@ -59,3 +59,32 @@ If you cannot produce all four, the checkbox stays `[ ]`. "It compiles" is not e
 Update `AUDIT.md`: strike the finding and append `**FIXED (date — evidence: command/file taken)**`. Un-strike nothing. Keep `TODO.md` honest, or don't touch it.
 
 Your claims will be re-audited against this repository. Make them true this time.
+
+---
+
+## 6. Semantic Versioning & Release Mandate (Organization-Wide Standard)
+
+All agents working across POX-project repositories must strictly adhere to Semantic Versioning (`MAJOR.MINOR.PATCH`):
+
+1. **PATCH (`x.x.Z` — Last Digit):**
+   - Increment for every minor fix, bug resolution, small addition, code hardening, or incremental test/documentation improvement.
+2. **MINOR (`x.Y.0` — Middle Digit):**
+   - Increment for moderate feature additions, functional enhancements, new controls/screens, or backward-compatible subsystem extensions. Resets PATCH to 0.
+3. **MAJOR (`X.0.0` — First Digit):**
+   - Increment for major releases, comprehensive rewrites, architectural overhauls, substantial multi-feature milestones, or breaking changes. Resets MINOR and PATCH to 0.
+
+### Release Documentation Requirements
+Every release published across the organization **must** include:
+- **Supported Versions & Targets:** Full specification of supported Android versions, kernel targets, SoC/hardware codenames (e.g., `begonia` MT6785, `m20lte` universal7885), ABI architectures (`arm64-v8a`), and minimum API levels.
+- **Detailed Changelog:** An itemized, honest record of every change, bug fix, and feature addition derived directly from the commit history.
+- **Maintainer & Author Credits:** Explicit naming of maintainers and contributors responsible for the work.
+- **Cryptographic Verification:** SHA-256 checksums and real build artifacts (APKs, boot/recovery images, flashable ZIPs, or execution logs).
+
+---
+
+## 7. Deep Commit & Architecture Understanding (Kernel & Low-Level Invariant)
+
+- **Inspect Before Touching:** Agents must deeply inspect commit logs (`git log`, diffs, commit messages, and architectural blueprints) before modifying any code.
+- **Kernel & Subsystem Safety:** For kernel trees (`pox-begonia-kernel`, `pox-m20lte-kernel`), device trees, vendor HALs, and native C++ engines, agents must understand the low-level hardware constraints, memory models, and driver contracts before modifying any source, configuration, or workflow.
+- **Build Task Execution & Active Communication:** Agents must relaunch build tasks to verify changes across projects, reporting clearly on every project what is being done.
+
