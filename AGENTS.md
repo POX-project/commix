@@ -73,18 +73,28 @@ All agents working across POX-project repositories must strictly adhere to Seman
 3. **MAJOR (`X.0.0` — First Digit):**
    - Increment for major releases, comprehensive rewrites, architectural overhauls, substantial multi-feature milestones, or breaking changes. Resets MINOR and PATCH to 0.
 
-### Release Documentation Requirements
-Every release published across the organization **must** include:
-- **Supported Versions & Targets:** Full specification of supported Android versions, kernel targets, SoC/hardware codenames (e.g., `begonia` MT6785, `m20lte` universal7885), ABI architectures (`arm64-v8a`), and minimum API levels.
-- **Detailed Changelog:** An itemized, honest record of every change, bug fix, and feature addition derived directly from the commit history.
-- **Maintainer & Author Credits:** Explicit naming of maintainers and contributors responsible for the work.
-- **Cryptographic Verification:** SHA-256 checksums and real build artifacts (APKs, boot/recovery images, flashable ZIPs, or execution logs).
+### Release Formatting & Documentation Standard
+Every release published across the organization **must** follow a unified, crystal-clear markdown structure to make navigation intuitive and fast for end users:
+- **Header Metadata Table / Badges:** Full specification of supported Android versions, kernel targets, SoC/hardware codenames (e.g., `begonia` MT6785, `m20lte` universal7885), ABI architectures (`arm64-v8a`), and minimum API levels.
+- **Executive Overview:** High-level summary of what this build provides.
+- **Detailed Itemized Changelog:** Categorized breakdown (New Features, Improvements, Fixes, Architecture Refactors) derived strictly from the verified commit history.
+- **Maintainers & Contributors:** Explicit attribution of authors and maintainers.
+- **Cryptographic Verification & Verified Artifacts:** SHA-256 checksums, exact file sizes, and direct links to verified build artifacts (APKs, boot/recovery images, flashable ZIPs, CLI binaries, or build logs).
+
+### Retroactive Compliance for Historical Releases
+- If pre-existing or legacy releases are found in any repository, agents must inspect and edit them to bring their release notes and metadata into compliance with the unified standard.
+- Old releases must clearly document their supported versions, target devices, changelog, and maintainers so users can seamlessly browse release history.
+
+### Initiating Fresh Builds
+- When a new tag is created or code/workflow fixes are implemented, agents must initiate fresh build workflows (via GitHub Actions `workflow_dispatch` or push triggers) and verify that the artifacts are produced, tested, and attached to the release.
+- A release is never considered complete until verified artifacts with cryptographic checksums are attached or accounted for.
 
 ---
 
 ## 7. Deep Commit & Architecture Understanding (Kernel & Low-Level Invariant)
 
-- **Inspect Before Touching:** Agents must deeply inspect commit logs (`git log`, diffs, commit messages, and architectural blueprints) before modifying any code.
-- **Kernel & Subsystem Safety:** For kernel trees (`pox-begonia-kernel`, `pox-m20lte-kernel`), device trees, vendor HALs, and native C++ engines, agents must understand the low-level hardware constraints, memory models, and driver contracts before modifying any source, configuration, or workflow.
+- **Inspect Before Touching:** Agents must deeply inspect commit logs (`git log -p`, branch topologies, commit messages, and architectural blueprints) before modifying any code.
+- **Kernel & Subsystem Safety:** For kernel trees (`pox-begonia-kernel`, `pox-m20lte-kernel`), device trees, vendor HALs, and native C++ engines, agents must thoroughly understand low-level hardware constraints, memory models, sysfs interfaces, and driver contracts before touching any source, configuration, or workflow.
 - **Build Task Execution & Active Communication:** Agents must relaunch build tasks to verify changes across projects, reporting clearly on every project what is being done.
+
 
