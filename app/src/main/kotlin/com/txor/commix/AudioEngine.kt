@@ -15,6 +15,10 @@ import kotlin.math.pow
  * external USB audio device detection, and cinema slate tone generation.
  */
 class AudioEngine(private val context: Context) {
+    fun interface AudioFrameSink {
+        fun onAudioFrame(pcmData: ShortArray, length: Int, sampleRate: Int)
+    }
+
     companion object {
         private const val TAG = "CommixAudioEngine"
 
@@ -33,6 +37,9 @@ class AudioEngine(private val context: Context) {
     @Volatile private var isMonitoringAudio: Boolean = false
     @Volatile private var gainDb: Float = 0.0f
     @Volatile private var lowCutEnabled: Boolean = false
+    @Volatile var audioFrameSink: AudioFrameSink? = null
+
+    val sampleRate: Int = 44100
 
     fun setGain(gain: Float) {
         gainDb = gain
@@ -45,12 +52,11 @@ class AudioEngine(private val context: Context) {
     @android.annotation.SuppressLint("MissingPermission")
     fun startAudioMonitoring() {
         if (isMonitoringAudio) return
-        val sampleRate = 44100
         val channelConfig = android.media.AudioFormat.CHANNEL_IN_MONO
         val audioFormat = android.media.AudioFormat.ENCODING_PCM_16BIT
         val minBuf = android.media.AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
         if (minBuf <= 0) {
-            Log.w(TAG, "Audio hardware does not support mono 44.1kHz")
+            Log.w(TAG, "Audio hardware does not support mono $sampleRate Hz")
             return
         }
         val bufferSize = minBuf.coerceAtLeast(2048)
@@ -104,6 +110,7 @@ class AudioEngine(private val context: Context) {
                                 prevY = y
                                 sample = y
                             }
+                            buffer[i] = sample.coerceIn(-32768.0, 32767.0).toInt().toShort()
                             sum += sample * sample
                         }
                         val rms = kotlin.math.sqrt(sum / read)
@@ -117,6 +124,7 @@ class AudioEngine(private val context: Context) {
                                 db.toFloat()
                             )
                         }
+                        audioFrameSink?.onAudioFrame(buffer, read, sampleRate)
                     } catch (_: Throwable) {
                         break
                     }
@@ -135,6 +143,7 @@ class AudioEngine(private val context: Context) {
 
     fun stopAudioMonitoring() {
         isMonitoringAudio = false
+        audioFrameSink = null
         try {
             audioRecord?.stop()
         } catch (_: Exception) {}
@@ -148,41 +157,56 @@ class AudioEngine(private val context: Context) {
         audioRecord = null
     }
 
-    fun applyMicrophoneDirection(recorder: MediaRecorder, direction: String, zoomAngle: Double = 0.0) {
+    /**
+     * Synthesizes 1kHz sine sync beep for SMPTE cinema slate clapperboard.
+     */
+    fun playSlateTone() {
+        Thread {
+            try {
+                if (toneGenerator == null) {
+                    toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
+                }
+                toneGenerator?.startTone(ToneGenerator.TONE_CDMA_PIP, 150)
+            } catch (e: Exception) {
+                Log.w(TAG, "Slate tone failed: ${e.message}")
+            }
+        }.start()
+    }
+
+    /**
+     * Sets polar pattern directivity on compatible USB/external multi-mic capsules (Android 10+).
+     */
+    fun setMicrophoneDirection(direction: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
-                when (direction.lowercase()) {
-                    "front" -> recorder.setPreferredMicrophoneDirection(MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER)
-                    "back" -> recorder.setPreferredMicrophoneDirection(MicrophoneDirection.MIC_DIRECTION_AWAY_FROM_USER)
-                    "external" -> recorder.setPreferredMicrophoneDirection(MicrophoneDirection.MIC_DIRECTION_EXTERNAL)
-                    else -> recorder.setPreferredMicrophoneDirection(MicrophoneDirection.MIC_DIRECTION_UNSPECIFIED)
-                }
-                if (zoomAngle > 0.0) {
-                    recorder.setPreferredMicrophoneFieldDimension(zoomAngle.toFloat().coerceIn(0.0f, 1.0f))
-                }
+                audioRecord?.setPreferredMicrophoneDirection(direction)
             } catch (e: Exception) {
-                Log.w(TAG, "setPreferredMicrophoneDirection failed: ${e.message}")
+                Log.w(TAG, "Polar directivity selection failed: ${e.message}")
             }
         }
     }
 
-    fun playSlateTone() {
-        try {
-            if (toneGenerator == null) {
-                toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
+    /**
+     * Detects external high-fidelity USB audio interfaces (UAC class-compliant) or Bluetooth mics.
+     */
+    fun getActiveAudioDeviceName(): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val devices = audioManager?.getDevices(AudioManager.GET_DEVICES_INPUTS) ?: return "Built-in Microphone"
+            for (dev in devices) {
+                if (dev.type == AudioDeviceInfo.TYPE_USB_DEVICE || dev.type == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                    return "USB: ${dev.productName}"
+                }
+                if (dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP) {
+                    return "Bluetooth: ${dev.productName}"
+                }
             }
-            toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP2, 160)
-        } catch (e: Exception) {
-            Log.w(TAG, "playSlateTone failed: ${e.message}")
         }
+        return "Built-in Microphone"
     }
 
     fun release() {
         stopAudioMonitoring()
-        try {
-            toneGenerator?.release()
-            toneGenerator = null
-        } catch (_: Exception) {}
+        toneGenerator?.release()
+        toneGenerator = null
     }
 }
-

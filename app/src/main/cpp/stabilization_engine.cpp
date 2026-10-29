@@ -10,6 +10,7 @@ StabilizationEngine::StabilizationEngine() noexcept
       m_writeIndex(0),
       m_isLogging(false),
       m_logStartIndex(0),
+      m_bufferMutex(),
       m_kalmanPitch(0.0f),
       m_kalmanRoll(0.0f),
       m_kalmanYaw(0.0f),
@@ -22,11 +23,18 @@ void StabilizationEngine::pushImuSample(
     float gx, float gy, float gz,
     float ax, float ay, float az
 ) noexcept {
-    size_t idx = m_writeIndex.fetch_add(1, std::memory_order_relaxed) % RING_BUFFER_CAPACITY;
-    m_ringBuffer[idx] = ImuSample{timestampNs, gx, gy, gz, ax, ay, az};
+    if (timestampNs < 0) return;
+    if (std::isnan(gx) || std::isnan(gy) || std::isnan(gz) ||
+        std::isnan(ax) || std::isnan(ay) || std::isnan(az)) return;
+
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
+    size_t idx = m_writeIndex.load(std::memory_order_relaxed);
+    m_ringBuffer[idx % RING_BUFFER_CAPACITY] = ImuSample{timestampNs, gx, gy, gz, ax, ay, az};
+    m_writeIndex.store(idx + 1, std::memory_order_release);
 }
 
 void StabilizationEngine::startLogging() noexcept {
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
     m_logStartIndex = m_writeIndex.load(std::memory_order_relaxed);
     m_isLogging.store(true, std::memory_order_release);
 }
@@ -37,30 +45,55 @@ bool StabilizationEngine::stopAndExportGyroflow(
     double frameRate
 ) noexcept {
     if (!outputPath || !outputPath[0]) return false;
-    m_isLogging.store(false, std::memory_order_release);
-    size_t endIndex = m_writeIndex.load(std::memory_order_relaxed);
+
+    std::vector<ImuSample> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(m_bufferMutex);
+        m_isLogging.store(false, std::memory_order_release);
+        size_t endIndex = m_writeIndex.load(std::memory_order_relaxed);
+
+        size_t sampleCount = (endIndex >= m_logStartIndex) ? (endIndex - m_logStartIndex) : 0;
+        if (sampleCount > RING_BUFFER_CAPACITY) sampleCount = RING_BUFFER_CAPACITY;
+
+        size_t start = (endIndex > sampleCount) ? (endIndex - sampleCount) : 0;
+        snapshot.reserve(sampleCount);
+        for (size_t i = start; i < endIndex; ++i) {
+            snapshot.push_back(m_ringBuffer[i % RING_BUFFER_CAPACITY]);
+        }
+    }
 
     FILE* fp = std::fopen(outputPath, "w");
     if (!fp) return false;
 
     std::fprintf(fp, "GYROFLOW IMU LOG\n");
     std::fprintf(fp, "version,1.3\n");
-    std::fprintf(fp, "camera_name,%s\n", (cameraName && cameraName[0]) ? cameraName : "Commix Cinema Camera");
+    std::fprintf(fp, "id,commix\n");
+    std::fprintf(fp, "orientation,YxZ\n");
+    std::fprintf(fp, "vendor,commix\n");
+    if (cameraName && cameraName[0]) {
+        std::fprintf(fp, "camera_name,%s\n", cameraName);
+    }
     std::fprintf(fp, "frame_rate,%.2f\n", frameRate > 0.0 ? frameRate : 30.0);
+    std::fprintf(fp, "tscale,1\n");
+    std::fprintf(fp, "gscale,1\n");
+    std::fprintf(fp, "ascale,0.10197162129779283\n");
     std::fprintf(fp, "t,gx,gy,gz,ax,ay,az\n");
 
-    size_t sampleCount = (endIndex >= m_logStartIndex) ? (endIndex - m_logStartIndex) : 0;
-    if (sampleCount > RING_BUFFER_CAPACITY) sampleCount = RING_BUFFER_CAPACITY;
+    if (!snapshot.empty()) {
+        int64_t baseTimeNs = snapshot.front().timestampNs;
+        double lastT = -1.0;
 
-    size_t start = (endIndex > sampleCount) ? (endIndex - sampleCount) : 0;
-    int64_t baseTimeNs = 0;
-
-    for (size_t i = start; i < endIndex; ++i) {
-        const auto& s = m_ringBuffer[i % RING_BUFFER_CAPACITY];
-        if (i == start) baseTimeNs = s.timestampNs;
-        double tSec = (s.timestampNs - baseTimeNs) * 1e-9;
-        std::fprintf(fp, "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                     tSec, s.gyroX, s.gyroY, s.gyroZ, s.accelX, s.accelY, s.accelZ);
+        for (const auto& s : snapshot) {
+            double tSec = (s.timestampNs >= baseTimeNs)
+                ? static_cast<double>(s.timestampNs - baseTimeNs) * 1e-9
+                : 0.0;
+            if (tSec < lastT) {
+                tSec = lastT;
+            }
+            lastT = tSec;
+            std::fprintf(fp, "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                         tSec, s.gyroX, s.gyroY, s.gyroZ, s.accelX, s.accelY, s.accelZ);
+        }
     }
 
     std::fclose(fp);
@@ -72,7 +105,7 @@ void StabilizationEngine::updateKalman(
     float& outPitch, float& outRoll, float& outYaw
 ) noexcept {
     // Process noise Q and Measurement noise R
-    const float Q = 0.005f * (dt > 0.0f ? dt : 0.016f);
+    const float Q = 0.005f * (dt > 0.0f ? dt : 0.016f);\
     const float R = 0.05f;
 
     // Pitch

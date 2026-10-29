@@ -90,6 +90,8 @@ data class CameraUiState(
     // Telemetry & Best Shot
     val lumaHistogram: IntArray = IntArray(256),
     val waveformCols: FloatArray = FloatArray(64),
+    val vectorscopeSamples: FloatArray = FloatArray(0),
+    val vectorscopeCount: Int = 0,
     val audioDb: Float = -60f,
     val audioNorm: Float = 0f,
     val spotIre: Float = 50f,
@@ -140,7 +142,7 @@ data class CameraUiState(
     val photoEnhanceAlgo: String = "clarity",
     val uncompressedAudio: Boolean = false,
     val defaultShutterAngle: String = "180",
-    val cinemaMatteRatio: String = "2.39:1",
+    val cinemaMatteRatio: String = "off",
     val nightFrameCount: Int = 8,
     val nightAstroAlignment: Boolean = true,
     val nightTone: String = "neutral",
@@ -149,7 +151,73 @@ data class CameraUiState(
     val automationTriggerMode: String = "timer",
     val queueWorkerThreads: Int = 2,
     val queueAutoQueueStacking: Boolean = true
-)
+) {
+    /** Snapshot of the active mode's exposure/optics settings, for stashing on a mode switch. */
+    fun currentModeSettings(): ModeSettings = ModeSettings(
+        iso = iso,
+        shutterNs = shutterNs,
+        evStops = evStops,
+        wbKelvin = wbKelvin,
+        focusDiopters = focusDiopters,
+        zoomRatio = zoomRatio,
+        toneCurve = toneCurve,
+        filmGrain = filmGrain,
+        isProcessZero = isProcessZeroActive,
+        showProControls = showProControls
+    )
+
+    /**
+     * Production mode-switch reducer: stashes the outgoing mode's settings and restores the incoming
+     * mode's saved settings (factory defaults when the target mode has never been visited).
+     * `CommixViewModel.onModeSelected` delegates to this.
+     */
+    fun switchToMode(mode: String): CameraUiState {
+        if (activeMode == mode) return this
+        val updatedMap = perModeSettings.toMutableMap()
+        updatedMap[activeMode] = currentModeSettings()
+        val restored = updatedMap[mode]
+        return copy(
+            activeMode = mode,
+            perModeSettings = updatedMap,
+            iso = restored?.iso ?: 0,
+            shutterNs = restored?.shutterNs ?: 0L,
+            evStops = restored?.evStops ?: 0f,
+            wbKelvin = restored?.wbKelvin ?: 0,
+            focusDiopters = restored?.focusDiopters ?: -1f,
+            zoomRatio = restored?.zoomRatio ?: 1.0,
+            toneCurve = restored?.toneCurve ?: "neutral",
+            filmGrain = restored?.filmGrain ?: "off",
+            isProcessZeroActive = restored?.isProcessZero ?: false,
+            showProControls = restored?.showProControls ?: (mode == "PRO")
+        )
+    }
+
+    /**
+     * Production EXIF privacy preset. `CommixViewModel.onSetExifPreset` delegates to this:
+     * privacy mode strips GPS, image description and user comment while retaining optical metadata.
+     */
+    fun withExifPreset(privacyMode: Boolean): CameraUiState = copy(
+        exifCameraInfo = true,
+        exifLensInfo = true,
+        exifExposureSettings = true,
+        exifDateTime = true,
+        exifLocation = !privacyMode,
+        exifImageDescription = !privacyMode,
+        exifUserComment = !privacyMode,
+        exifColorGeometry = true
+    )
+
+    /** Production mapping from UI EXIF toggles to the repository's [ExifOptions] consumer. */
+    fun toExifOptions(): ExifOptions = ExifOptions(
+        cameraInfo = exifCameraInfo,
+        location = exifLocation,
+        userComment = exifUserComment,
+        lensSpecs = exifLensInfo,
+        exposureSettings = exifExposureSettings,
+        dateTime = exifDateTime,
+        imageDescription = exifImageDescription
+    )
+}
 
 @Immutable
 data class ModeSettings(
@@ -164,4 +232,3 @@ data class ModeSettings(
     val isProcessZero: Boolean = false,
     val showProControls: Boolean = false
 )
-

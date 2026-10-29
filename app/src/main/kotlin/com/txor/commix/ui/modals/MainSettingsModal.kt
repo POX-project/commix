@@ -20,6 +20,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.txor.commix.PhotoFormatEngine
 import com.txor.commix.model.CameraUiState
 import com.txor.commix.ui.CommixViewModel
 import com.txor.commix.ui.theme.AppleYellow
@@ -152,19 +153,43 @@ fun MainSettingsModal(
                 when (selectedTab) {
                     "PHOTO" -> {
                         SettingsCard(title = "Photo Format & Compression") {
+                            val isLossless = PhotoFormatEngine.isLossless(state.photoFormat, state.photoQuality)
+                            val isZeroComp = PhotoFormatEngine.isZeroCompression(state.photoFormat)
+                            val formatSubtitle = when {
+                                isZeroComp -> "${state.photoFormat.uppercase()} · Zero Compression (Archival Exact)"
+                                isLossless -> "${state.photoFormat.uppercase()} · 100% (Lossless Compressed)"
+                                else -> "${state.photoFormat.uppercase()} · ${state.photoQuality}% Quality"
+                            }
                             SettingsSegmentedRow(
-                                title = "Still Format",
-                                subtitle = "${state.photoFormat.uppercase()} · ${state.photoQuality}%",
-                                options = listOf("jpeg" to "JPEG", "webp" to "WEBP", "png" to "PNG"),
+                                title = "Standard Formats",
+                                subtitle = formatSubtitle,
+                                options = listOf(
+                                    "jpeg" to "JPEG",
+                                    "heic" to "HEIC",
+                                    "webp" to "WEBP",
+                                    "png" to "PNG"
+                                ),
                                 selected = state.photoFormat,
                                 onSelected = { viewModel.onFormatChanged(it, state.photoQuality) }
                             )
                             Spacer(modifier = Modifier.height(10.dp))
+                            SettingsSegmentedRow(
+                                title = "Uncompressed & Lossless (Zero Compression)",
+                                subtitle = "Bit-exact pixel streams without compression algorithms",
+                                options = listOf(
+                                    "lossless" to "BMP (Raw)",
+                                    "tiff" to "TIFF 6.0",
+                                    "raw_dng" to "RAW DNG"
+                                ),
+                                selected = state.photoFormat,
+                                onSelected = { viewModel.onFormatChanged(it, 100) }
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
                             SettingsSliderRow(
                                 title = "Compression Quality",
-                                value = state.photoQuality.toFloat(),
+                                value = (if (isLossless) 100 else state.photoQuality).toFloat(),
                                 range = 50f..100f,
-                                label = "${state.photoQuality}%",
+                                label = if (isLossless) "100% (Lossless)" else "${state.photoQuality}%",
                                 onValueChange = { viewModel.onFormatChanged(state.photoFormat, it.toInt()) }
                             )
                             Spacer(modifier = Modifier.height(10.dp))
@@ -201,8 +226,8 @@ fun MainSettingsModal(
                         SettingsCard(title = "Video Encoding & Bitrate") {
                             SettingsSegmentedRow(
                                 title = "Video Codec",
-                                subtitle = "Hardware AVC / HEVC / ProRes HQ",
-                                options = listOf("hevc" to "H.265 / HEVC", "h264" to "H.264", "prores" to "ProRes HQ"),
+                                subtitle = "Hardware AVC / HEVC / All-I Intra",
+                                options = listOf("hevc" to "H.265 / HEVC", "h264" to "H.264", "all_i" to "All-I Intra"),
                                 selected = state.videoCodec,
                                 onSelected = { viewModel.onSetVideoCodec(it) }
                             )
@@ -228,8 +253,8 @@ fun MainSettingsModal(
 
                         SettingsCard(title = "Audio Pipeline & Viewfinder") {
                             SettingsToggleRow(
-                                title = "Uncompressed LPCM 48kHz Audio",
-                                subtitle = "Studio broadcast 24-bit audio stream",
+                                title = "Broadcast Quality Audio (384kbps AAC LC)",
+                                subtitle = "Studio broadcast high-bitrate audio stream",
                                 checked = state.uncompressedAudio,
                                 onCheckedChange = { viewModel.onToggleUncompressedAudio() }
                             )
@@ -264,6 +289,13 @@ fun MainSettingsModal(
                                 subtitle = "IRE calibration and channel clipping analysis",
                                 checked = state.showWaveform,
                                 onCheckedChange = { viewModel.toggleWaveform() }
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingsToggleRow(
+                                title = "Chroma Vectorscope (Polar)",
+                                subtitle = "Real-time hue and chroma saturation polar graticule",
+                                checked = state.showVectorscope,
+                                onCheckedChange = { viewModel.toggleVectorscope() }
                             )
                             Spacer(modifier = Modifier.height(10.dp))
                             SettingsSegmentedRow(

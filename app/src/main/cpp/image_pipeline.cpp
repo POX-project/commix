@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <vector>
 #include <mutex>
-#include <condition_variable>
+#include <latch>
 #include <atomic>
 
 namespace commix {
@@ -83,69 +83,65 @@ bool ImagePipeline::processZero(
     const int threadCount = 8;
     const int rowsPerThread = (height + threadCount - 1) / threadCount;
 
-    std::mutex cvMutex;
-    std::condition_variable cv;
-    int completedTasks = 0;
-    int activeTasks = 0;
+    int slices = 0;
+    for (int t = 0; t < threadCount; ++t) {
+        const int startY = t * rowsPerThread;
+        if (startY < std::min(startY + rowsPerThread, height)) ++slices;
+    }
+    if (slices == 0) return true;
+
+    // Completions for exactly `slices` tasks using C++20 latch: wait() returns after
+    // all count_down() calls; latch is destroyed safely with zero notify-after-destroy race.
+    std::latch done(slices);
 
     for (int t = 0; t < threadCount; ++t) {
         const int startY = t * rowsPerThread;
         const int endY = std::min(startY + rowsPerThread, height);
         if (startY >= endY) continue;
 
-        activeTasks++;
-        ThreadPool::instance().enqueue([pixelData, width, channels, startY, endY, lut, applyGrain, grainScale, t, frameIdx, &cvMutex, &cv, &completedTasks]() {
-            uint32_t seed = (0x12345678u ^ (frameIdx * 2654435761u)) ^ static_cast<uint32_t>(t * 7919);
+        const bool queued = ThreadPool::instance().enqueue(
+            [pixelData, width, channels, startY, endY, lut, applyGrain, grainScale, t, frameIdx, &done]() {
+                uint32_t seed = (0x12345678u ^ (frameIdx * 2654435761u)) ^ static_cast<uint32_t>(t * 7919);
 
-            for (int y = startY; y < endY; ++y) {
-                uint8_t* row = pixelData + (static_cast<size_t>(y) * width * channels);
-                for (int x = 0; x < width; ++x) {
-                    uint8_t* px = row + (x * channels);
-                    int r = px[0];
-                    int g = px[1];
-                    int b = px[2];
+                for (int y = startY; y < endY; ++y) {
+                    uint8_t* row = pixelData + (static_cast<size_t>(y) * width * channels);
+                    for (int x = 0; x < width; ++x) {
+                        uint8_t* px = row + (x * channels);
+                        int r = px[0];
+                        int g = px[1];
+                        int b = px[2];
 
-                    if (lut) {
-                        r = lut[r];
-                        g = lut[g];
-                        b = lut[b];
+                        if (lut) {
+                            r = lut[r];
+                            g = lut[g];
+                            b = lut[b];
+                        }
+
+                        if (applyGrain) {
+                            float luma = (0.2126f * r + 0.7152f * g + 0.0722f * b) * (1.0f / 255.0f);
+                            float mask = std::max(0.0f, 4.0f * luma * (1.0f - luma));
+                            float randVal = (static_cast<float>(xorshift32(seed) % 1000) / 500.0f) - 1.0f;
+                            float noise = randVal * grainScale * mask;
+
+                            r = std::clamp(static_cast<int>(r + noise), 0, 255);
+                            g = std::clamp(static_cast<int>(g + noise), 0, 255);
+                            b = std::clamp(static_cast<int>(b + noise), 0, 255);
+                        }
+
+                        px[0] = static_cast<uint8_t>(r);
+                        px[1] = static_cast<uint8_t>(g);
+                        px[2] = static_cast<uint8_t>(b);
                     }
-
-                    if (applyGrain) {
-                        // Luma in 0.0 .. 1.0
-                        float luma = (0.2126f * r + 0.7152f * g + 0.0722f * b) * (1.0f / 255.0f);
-                        // Parabolic midtone mask: peaks at 0.5 (18% middle grey), attenuates at 0 and 1
-                        float mask = 4.0f * luma * (1.0f - luma);
-                        mask = std::max(0.0f, mask);
-
-                        // Uniform noise in [-1.0, 1.0]
-                        float randVal = (static_cast<float>(xorshift32(seed) % 1000) / 500.0f) - 1.0f;
-                        float noise = randVal * grainScale * mask;
-
-                        r = std::clamp(static_cast<int>(r + noise), 0, 255);
-                        g = std::clamp(static_cast<int>(g + noise), 0, 255);
-                        b = std::clamp(static_cast<int>(b + noise), 0, 255);
-                    }
-
-                    px[0] = static_cast<uint8_t>(r);
-                    px[1] = static_cast<uint8_t>(g);
-                    px[2] = static_cast<uint8_t>(b);
                 }
+                done.count_down();
             }
-            {
-                std::lock_guard<std::mutex> lk(cvMutex);
-                completedTasks++;
-            }
-            cv.notify_one();
-        });
+        );
+        if (!queued) {
+            done.count_down();
+        }
     }
 
-    // Wait for all worker slices to complete without spinning
-    {
-        std::unique_lock<std::mutex> lk(cvMutex);
-        cv.wait(lk, [&]() { return completedTasks >= activeTasks; });
-    }
-
+    done.wait();
     return true;
 }
 
@@ -157,36 +153,80 @@ void ImagePipeline::applyUnsharpMask(
     float amount,
     float radius
 ) noexcept {
-    if (!pixelData || width <= 2 || height <= 2 || channels < 3) return;
+    if (!pixelData || width <= 0 || height <= 0 || channels < 3) return;
 
-    // Simple 3x3 Laplacian sharpening approximation
     const float weight = std::clamp(amount, 0.0f, 2.0f);
-    if (weight <= 0.01f) return;
+    if (weight <= 0.001f) return;
 
-    const size_t rowBytes = static_cast<size_t>(width) * channels;
-    std::vector<uint8_t> prevRow(pixelData, pixelData + rowBytes);
-    std::vector<uint8_t> currRow(pixelData + rowBytes, pixelData + 2 * rowBytes);
+    // radius (pixels) -> odd kernel half-width R, sigma = R / 3.0
+    int R = static_cast<int>(std::ceil(radius));
+    if (R < 1) R = 1;
+    if (R > 32) R = 32;
+    const int maxR = std::min(width, height) - 1;
+    if (R > maxR) R = maxR;
+    if (R < 1) return;
 
-    for (int y = 1; y < height - 1; ++y) {
-        uint8_t* rowCurr = pixelData + (static_cast<size_t>(y) * rowBytes);
-        const uint8_t* rowNext = pixelData + (static_cast<size_t>(y + 1) * rowBytes);
+    const float sigma = R / 3.0f;
+    const int k = 2 * R + 1;
+    std::vector<float> kernel(k);
+    float ksum = 0.0f;
+    for (int i = -R; i <= R; ++i) {
+        const float w = std::exp(-(static_cast<float>(i) * i) / (2.0f * sigma * sigma));
+        kernel[i + R] = w;
+        ksum += w;
+    }
+    for (float& w : kernel) w /= ksum;
 
-        for (int x = 1; x < width - 1; ++x) {
-            for (int c = 0; c < 3; ++c) {
-                int center = currRow[x * channels + c];
-                int surrounding = (prevRow[x * channels + c] +
-                                   rowNext[x * channels + c] +
-                                   currRow[(x - 1) * channels + c] +
-                                   currRow[(x + 1) * channels + c]) >> 2;
-                int diff = center - surrounding;
-                int sharpened = static_cast<int>(center + diff * weight);
-                rowCurr[x * channels + c] = static_cast<uint8_t>(std::clamp(sharpened, 0, 255));
+    const size_t pixels = static_cast<size_t>(width) * height;
+    std::vector<float> src(pixels * 3);
+    std::vector<float> tmp(pixels * 3);
+    for (size_t i = 0; i < pixels; ++i) {
+        src[i * 3 + 0] = pixelData[i * channels + 0];
+        src[i * 3 + 1] = pixelData[i * channels + 1];
+        src[i * 3 + 2] = pixelData[i * channels + 2];
+    }
+
+    // Horizontal pass: src -> tmp with clamp-to-edge
+    for (int y = 0; y < height; ++y) {
+        const float* srow = &src[static_cast<size_t>(y) * width * 3];
+        float* trow = &tmp[static_cast<size_t>(y) * width * 3];
+        for (int x = 0; x < width; ++x) {
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+            for (int i = -R; i <= R; ++i) {
+                int xx = x + i;
+                xx = (xx < 0) ? 0 : ((xx >= width) ? width - 1 : xx);
+                const float w = kernel[i + R];
+                a0 += srow[xx * 3 + 0] * w;
+                a1 += srow[xx * 3 + 1] * w;
+                a2 += srow[xx * 3 + 2] * w;
             }
+            trow[x * 3 + 0] = a0;
+            trow[x * 3 + 1] = a1;
+            trow[x * 3 + 2] = a2;
         }
+    }
 
-        prevRow = std::move(currRow);
-        if (y + 1 < height - 1) {
-            currRow.assign(rowNext, rowNext + rowBytes);
+    // Vertical pass + blend: out = clamp(center + weight * (center - blurred))
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+            for (int i = -R; i <= R; ++i) {
+                int yy = y + i;
+                yy = (yy < 0) ? 0 : ((yy >= height) ? height - 1 : yy);
+                const float w = kernel[i + R];
+                const float* p = &tmp[(static_cast<size_t>(yy) * width + x) * 3];
+                b0 += p[0] * w;
+                b1 += p[1] * w;
+                b2 += p[2] * w;
+            }
+            const size_t o = static_cast<size_t>(y) * width + x;
+            uint8_t* px = pixelData + o * channels;
+            const float c0 = src[o * 3 + 0];
+            const float c1 = src[o * 3 + 1];
+            const float c2 = src[o * 3 + 2];
+            px[0] = static_cast<uint8_t>(std::clamp(c0 + weight * (c0 - b0), 0.0f, 255.0f));
+            px[1] = static_cast<uint8_t>(std::clamp(c1 + weight * (c1 - b1), 0.0f, 255.0f));
+            px[2] = static_cast<uint8_t>(std::clamp(c2 + weight * (c2 - b2), 0.0f, 255.0f));
         }
     }
 }

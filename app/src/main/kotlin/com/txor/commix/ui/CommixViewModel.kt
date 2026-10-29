@@ -3,13 +3,16 @@ package com.txor.commix.ui
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.provider.MediaStore
 import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.txor.commix.CaptureRequestFactory
 import com.txor.commix.CaptureRequestParams
 import com.txor.commix.PanoramaStitcher
+import com.txor.commix.PhotoFormatEngine
 import com.txor.commix.PipelineThroughputEngine
 import com.txor.commix.ProcessingJobQueue
 import com.txor.commix.automation.AutomationEngine
@@ -40,6 +43,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     val uiState: StateFlow<CameraUiState> = _uiState.asStateFlow()
 
     private var activeSurface: Surface? = null
+    private var activeSurfaceTexture: SurfaceTexture? = null
 
     init {
         val cameras = repository.getProbedCameras()
@@ -61,13 +65,16 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         repository.onPreviewSizeConfigured = { previewSize, aspect, mp ->
-            _uiState.update { it.copy(
-                previewWidth = previewSize.width,
-                previewHeight = previewSize.height,
-                previewAspectRatio = aspect,
-                targetPhotoMp = if (it.targetPhotoMp <= 0.0 || it.targetPhotoMp == it.maxLensMp) mp else it.targetPhotoMp,
-                maxLensMp = mp
-            ) }
+            _uiState.update { current ->
+                val activeCam = current.availableCameras.find { it.cameraId == current.activeCameraId }
+                val resolvedMax = if (current.maxLensMp > 0.0) current.maxLensMp else (activeCam?.sensorMp ?: mp)
+                current.copy(
+                    previewWidth = previewSize.width,
+                    previewHeight = previewSize.height,
+                    previewAspectRatio = aspect,
+                    maxLensMp = resolvedMax
+                )
+            }
         }
 
         repository.onPhotoSaved = { uri ->
@@ -95,6 +102,9 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         repository.onError = { msg ->
+            videoTimerJob?.cancel()
+            videoTimerJob = null
+            recordingJob = null
             _uiState.update { it.copy(statusMessage = msg, isCapturing = false, isRecording = false, isPanoramaCapturing = false) }
         }
 
@@ -115,43 +125,65 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private var videoTimerJob: kotlinx.coroutines.Job? = null
+    private var recordingJob: kotlinx.coroutines.Job? = null
     private var timeLapseJob: kotlinx.coroutines.Job? = null
     private var automationJob: kotlinx.coroutines.Job? = null
+    @Volatile
+    private var isForeground: Boolean = true
 
-    fun onSurfaceAvailable(surface: Surface) {
+    fun onAppForeground() {
+        isForeground = true
+        repository.resumeCamera()
+    }
+
+    fun onAppBackground() {
+        isForeground = false
+        if (_uiState.value.isRecording) {
+            onShutterTapped()
+        }
+        repository.pauseCamera()
+        _uiState.update { it.copy(ready = false) }
+    }
+
+    fun onSurfaceAvailable(surface: Surface, surfaceTexture: SurfaceTexture? = null) {
         activeSurface = surface
-        repository.openCamera(_uiState.value.activeCameraId, surface) {
+        activeSurfaceTexture = surfaceTexture
+        repository.openCamera(_uiState.value.activeCameraId, surface, surfaceTexture) {
             _uiState.update { it.copy(ready = true) }
         }
     }
 
     fun onSurfaceDestroyed() {
         activeSurface = null
+        activeSurfaceTexture = null
         repository.onSurfaceDestroyed()
+        _uiState.update { it.copy(ready = false) }
     }
 
     private fun startTelemetryPolling() {
         viewModelScope.launch(Dispatchers.Default) {
             val scores = FloatArray(4)
-            val floats = FloatArray(10)
+            val floats = FloatArray(11)
             val luma = IntArray(256)
             val wave = FloatArray(64)
+            val vscope = FloatArray(512)
             val keyVals = FloatArray(6)
 
             while (isActive) {
                 try {
-                    if (!com.txor.commix.bridge.NativeTelemetryBridge.isLoaded) {
-                        delay(500)
+                    if (!isForeground || !com.txor.commix.bridge.NativeTelemetryBridge.isLoaded) {
+                        delay(250)
                         continue
                     }
 
-                    // 1. Read live C++ seqlock telemetry (Scopes, Audio VU, IMU, Spot IRE)
-                    val hasTelemetry = com.txor.commix.bridge.NativeTelemetryBridge.nativeReadTelemetry(floats, luma, wave)
+                    // 1. Read live C++ seqlock telemetry (Scopes, Audio VU, IMU, Spot IRE, Vectorscope)
+                    val hasTelemetry = com.txor.commix.bridge.NativeTelemetryBridge.nativeReadTelemetry(floats, luma, wave, vscope)
 
                     // 2. Poll Best Shot Evaluation at 30Hz
                     val spot = if (hasTelemetry) floats[7] else 50.0f
                     val hiClip = if (hasTelemetry) floats[8] else 0.0f
                     val loClip = if (hasTelemetry) floats[9] else 0.0f
+                    val vCount = if (hasTelemetry && floats.size >= 11) floats[10].toInt() else 0
                     val shouldShoot = NativeEngineBridge.nativeEvaluateBestShot(spot, hiClip, loClip, scores)
                     val totalScore = scores[3]
 
@@ -164,6 +196,8 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
                             loClipPct = if (hasTelemetry) floats[9] else current.loClipPct,
                             lumaHistogram = if (hasTelemetry && (current.showHistogram || current.showScopes)) luma.clone() else current.lumaHistogram,
                             waveformCols = if (hasTelemetry && (current.showWaveform || current.showScopes)) wave.clone() else current.waveformCols,
+                            vectorscopeSamples = if (hasTelemetry && (current.showVectorscope || current.showScopes)) vscope.clone() else current.vectorscopeSamples,
+                            vectorscopeCount = if (hasTelemetry && (current.showVectorscope || current.showScopes)) vCount else current.vectorscopeCount,
                             bestShotScore = totalScore,
                             shouldShowShootNow = shouldShoot
                         )
@@ -176,42 +210,8 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun onModeSelected(mode: String) {
-        val cur = _uiState.value
-        val oldMode = cur.activeMode
-        if (oldMode == mode) return
-
-        val oldSettings = com.txor.commix.model.ModeSettings(
-            iso = cur.iso,
-            shutterNs = cur.shutterNs,
-            evStops = cur.evStops,
-            wbKelvin = cur.wbKelvin,
-            focusDiopters = cur.focusDiopters,
-            zoomRatio = cur.zoomRatio,
-            toneCurve = cur.toneCurve,
-            filmGrain = cur.filmGrain,
-            isProcessZero = cur.isProcessZeroActive,
-            showProControls = cur.showProControls
-        )
-        val updatedMap = cur.perModeSettings.toMutableMap()
-        updatedMap[oldMode] = oldSettings
-
-        val restored = updatedMap[mode]
-        _uiState.update {
-            it.copy(
-                activeMode = mode,
-                perModeSettings = updatedMap,
-                iso = restored?.iso ?: 0,
-                shutterNs = restored?.shutterNs ?: 0L,
-                evStops = restored?.evStops ?: 0f,
-                wbKelvin = restored?.wbKelvin ?: 0,
-                focusDiopters = restored?.focusDiopters ?: -1f,
-                zoomRatio = restored?.zoomRatio ?: 1.0,
-                toneCurve = restored?.toneCurve ?: "neutral",
-                filmGrain = restored?.filmGrain ?: "off",
-                isProcessZeroActive = restored?.isProcessZero ?: false,
-                showProControls = restored?.showProControls ?: (mode == "PRO")
-            )
-        }
+        if (_uiState.value.activeMode == mode) return
+        _uiState.update { it.switchToMode(mode) }
         updateRepositoryParams()
     }
 
@@ -270,26 +270,33 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
                 if (s.isRecording) {
                     videoTimerJob?.cancel()
                     videoTimerJob = null
-                    repository.stopVideoRecording()
                     _uiState.update { it.copy(isRecording = false) }
+                    val priorJob = recordingJob
+                    recordingJob = null
+                    viewModelScope.launch(Dispatchers.Default) {
+                        priorJob?.join()
+                        repository.stopVideoRecording()
+                    }
                 } else {
                     val isSlowMo = (s.activeMode == "SLOW-MO")
                     val effectiveFps = if (isSlowMo) s.slowMoFps else s.videoFps
                     val effectiveFpsFloat = if (isSlowMo) s.slowMoFps.toDouble() else s.videoFpsFloat
-                    repository.startVideoRecording(
-                        res = s.videoResolution,
-                        fps = effectiveFps,
-                        bitrate = s.videoBitrateBps,
-                        isVfDisabled = s.viewfinderDisabled,
-                        targetFpsFloat = effectiveFpsFloat,
-                        isSlowMotion = isSlowMo
-                    )
                     _uiState.update { it.copy(isRecording = true, recordingSeconds = 0) }
                     videoTimerJob = viewModelScope.launch {
                         while (isActive) {
                             delay(1000)
                             _uiState.update { it.copy(recordingSeconds = it.recordingSeconds + 1) }
                         }
+                    }
+                    recordingJob = viewModelScope.launch(Dispatchers.Default) {
+                        repository.startVideoRecording(
+                            res = s.videoResolution,
+                            fps = effectiveFps,
+                            bitrate = s.videoBitrateBps,
+                            isVfDisabled = s.viewfinderDisabled,
+                            targetFpsFloat = effectiveFpsFloat,
+                            isSlowMotion = isSlowMo
+                        )
                     }
                 }
             }
@@ -382,6 +389,16 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         preferences.save(_uiState.value)
     }
 
+    fun toggleVectorscope() {
+        _uiState.update { it.copy(showVectorscope = !it.showVectorscope) }
+        preferences.save(_uiState.value)
+    }
+
+    fun toggleScopes() {
+        _uiState.update { it.copy(showScopes = !it.showScopes) }
+        preferences.save(_uiState.value)
+    }
+
     fun toggleHorizon() {
         _uiState.update { it.copy(showHorizonLeveler = !it.showHorizonLeveler) }
         preferences.save(_uiState.value)
@@ -408,7 +425,23 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun onFormatChanged(format: String, quality: Int) {
-        _uiState.update { it.copy(photoFormat = format, photoQuality = quality) }
+        val targetQuality = if (PhotoFormatEngine.isLossless(format)) 100 else quality.coerceIn(1, 100)
+        _uiState.update { it.copy(photoFormat = format, photoQuality = targetQuality) }
+        preferences.save(_uiState.value)
+        updateRepositoryParams()
+    }
+
+    fun onCyclePhotoFormat() {
+        val current = _uiState.value.photoFormat.lowercase()
+        val formats = PhotoFormatEngine.SUPPORTED_FORMATS
+        val currentIndex = formats.indexOf(current)
+        val nextFormat = if (currentIndex != -1) {
+            formats[(currentIndex + 1) % formats.size]
+        } else {
+            formats.first()
+        }
+        val targetQuality = if (PhotoFormatEngine.isLossless(nextFormat)) 100 else _uiState.value.photoQuality
+        _uiState.update { it.copy(photoFormat = nextFormat, photoQuality = targetQuality) }
         preferences.save(_uiState.value)
         updateRepositoryParams()
     }
@@ -440,8 +473,13 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
             nightAstroAlignment = s.nightAstroAlignment,
             timeLapseIntervalSec = s.timeLapseIntervalSec,
             uncompressedAudio = s.uncompressedAudio,
+            audioLowCut = s.audioLowCut,
+            audioGain = s.audioGainDb,
+            adaptivePerformanceEnabled = s.adaptivePerformanceEnabled,
+            nightTone = s.nightTone,
             cinemaMatteRatio = s.cinemaMatteRatio,
             photoFormat = s.photoFormat,
+            photoQuality = s.photoQuality,
             photoEnhanceAlgo = s.photoEnhanceAlgo,
             aebEnabled = s.aebEnabled,
             aebShots = s.aebShots,
@@ -450,15 +488,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         )
         ProcessingJobQueue.instance.maxConcurrentJobs = s.queueWorkerThreads.coerceIn(1, 8)
         ProcessingJobQueue.instance.autoQueueVideoStabilization = s.queueAutoQueueStacking
-        repository.exifOptions = com.txor.commix.model.ExifOptions(
-            cameraInfo = s.exifCameraInfo,
-            location = s.exifLocation,
-            userComment = s.exifUserComment,
-            lensSpecs = s.exifLensInfo,
-            exposureSettings = s.exifExposureSettings,
-            dateTime = s.exifDateTime,
-            imageDescription = s.exifImageDescription
-        )
+        repository.exifOptions = s.toExifOptions()
         repository.updateParams(params)
     }
 
@@ -466,18 +496,26 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onSelectCamera(cameraId: String) {
         if (_uiState.value.activeCameraId == cameraId) return
         val cam = _uiState.value.availableCameras.find { it.cameraId == cameraId }
-        _uiState.update {
-            it.copy(
+            ?: repository.getProbedCameras().find { it.cameraId == cameraId }
+        _uiState.update { current ->
+            val updatedAvailable = if (cam != null && current.availableCameras.none { it.cameraId == cam.cameraId }) {
+                current.availableCameras + cam
+            } else {
+                current.availableCameras
+            }
+            current.copy(
                 activeCameraId = cameraId,
-                maxLensMp = cam?.sensorMp ?: it.maxLensMp,
-                targetPhotoMp = cam?.sensorMp ?: it.targetPhotoMp,
+                availableCameras = updatedAvailable,
+                maxLensMp = cam?.sensorMp ?: current.maxLensMp,
+                targetPhotoMp = cam?.sensorMp ?: current.targetPhotoMp,
                 hardwareMaxDigitalZoom = cam?.maxDigitalZoom ?: 10.0,
-                maxZoomRatio = if (it.spaceZoomLockEngaged) 100.0 else 30.0,
+                maxZoomRatio = if (current.spaceZoomLockEngaged) 100.0 else 30.0,
                 ready = false
             )
         }
+        updateRepositoryParams()
         activeSurface?.let { surface ->
-            repository.openCamera(cameraId, surface) {
+            repository.openCamera(cameraId, surface, activeSurfaceTexture) {
                 _uiState.update { it.copy(ready = true) }
                 updateRepositoryParams()
             }
@@ -586,8 +624,15 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun onToggleRaw() {
-        val nextRaw = if (_uiState.value.photoFormat == "raw_dng") "jpeg" else "raw_dng"
-        _uiState.update { it.copy(photoFormat = nextRaw) }
+        val nextFormat = if (_uiState.value.photoFormat == PhotoFormatEngine.FORMAT_RAW_DNG) {
+            PhotoFormatEngine.FORMAT_JPEG
+        } else {
+            PhotoFormatEngine.FORMAT_RAW_DNG
+        }
+        val targetQuality = if (PhotoFormatEngine.isLossless(nextFormat)) 100 else _uiState.value.photoQuality
+        _uiState.update { it.copy(photoFormat = nextFormat, photoQuality = targetQuality) }
+        preferences.save(_uiState.value)
+        updateRepositoryParams()
     }
 
     fun onUpdatePhotoMp(mp: Double) {
@@ -673,7 +718,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
 
     fun onShutterAngleChanged(angleDeg: Double) {
         val fps = if (_uiState.value.videoFpsFloat > 0) _uiState.value.videoFpsFloat else 30.0
-        val ns = (1_000_000_000.0 * (angleDeg / 360.0) / fps).toLong()
+        val ns = CaptureRequestFactory.shutterAngleToExposureNs(angleDeg, fps)
         _uiState.update { it.copy(shutterAngleDeg = angleDeg, shutterNs = ns) }
         updateRepositoryParams()
     }
@@ -717,6 +762,8 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onAudioGainChanged(gainDb: Float) {
         _uiState.update { it.copy(audioGainDb = gainDb) }
         repository.audioEngine.setGain(gainDb)
+        preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus("Audio Mic Gain: ${gainDb.toInt()} dB")
     }
 
@@ -724,6 +771,8 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         val next = !_uiState.value.audioLowCut
         _uiState.update { it.copy(audioLowCut = next) }
         repository.audioEngine.setLowCut(next)
+        preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus(if (next) "Audio Low Cut: 80Hz Active" else "Audio Low Cut: Off")
     }
 
@@ -796,18 +845,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun onSetExifPreset(privacyMode: Boolean) {
-        _uiState.update {
-            it.copy(
-                exifCameraInfo = true,
-                exifLensInfo = true,
-                exifExposureSettings = true,
-                exifDateTime = true,
-                exifLocation = !privacyMode,
-                exifImageDescription = !privacyMode,
-                exifUserComment = !privacyMode,
-                exifColorGeometry = true
-            )
-        }
+        _uiState.update { it.withExifPreset(privacyMode) }
         preferences.save(_uiState.value)
         showStatus(if (privacyMode) "EXIF Privacy Mode: Geotags Stripped" else "EXIF: All Optical & Location Metadata Allowed")
     }
@@ -866,13 +904,17 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(uncompressedAudio = next) }
         preferences.save(_uiState.value)
         updateRepositoryParams()
-        showStatus(if (next) "Audio: LPCM 48kHz Uncompressed" else "Audio: AAC Standard")
+        showStatus(if (next) "Audio: AAC Broadcast 384kbps" else "Audio: AAC Standard 192kbps")
     }
 
     fun onSetDefaultShutterAngle(angle: String) {
-        _uiState.update { it.copy(defaultShutterAngle = angle) }
+        val angleDeg = angle.toDoubleOrNull() ?: 180.0
+        val effectiveFps = _uiState.value.videoFps.toDouble().coerceAtLeast(1.0)
+        val expNs = CaptureRequestFactory.shutterAngleToExposureNs(angleDeg, effectiveFps)
+        _uiState.update { it.copy(defaultShutterAngle = angle, shutterNs = expNs) }
         preferences.save(_uiState.value)
-        showStatus("Default Shutter Angle: ${angle}°")
+        updateRepositoryParams()
+        showStatus("Default Shutter Angle: ${angle}° (${expNs / 1_000_000}ms)")
     }
 
     fun onSetCinemaMatteRatio(ratio: String) {
@@ -900,6 +942,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onSetNightTone(tone: String) {
         _uiState.update { it.copy(nightTone = tone) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus("Night Tone: ${tone.uppercase()}")
     }
 
@@ -1093,7 +1136,12 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         videoTimerJob = null
         AutomationEngine.stopNativeBridge()
         if (_uiState.value.isRecording) {
-            repository.stopVideoRecording()
+            val priorJob = recordingJob
+            recordingJob = null
+            viewModelScope.launch(Dispatchers.Default) {
+                priorJob?.join()
+                repository.stopVideoRecording()
+            }
         }
         _uiState.update {
             it.copy(
@@ -1149,14 +1197,14 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
 
             withContext(Dispatchers.Main) {
                 CommixHaptics.heavy(getApplication(), s.hapticsEnabled)
-                repository.startVideoRecording(
-                    res = s.videoResolution,
-                    fps = s.videoFps,
-                    bitrate = s.videoBitrateBps,
-                    isVfDisabled = s.viewfinderDisabled,
-                    targetFpsFloat = s.videoFpsFloat
-                )
             }
+            repository.startVideoRecording(
+                res = s.videoResolution,
+                fps = s.videoFps,
+                bitrate = s.videoBitrateBps,
+                isVfDisabled = s.viewfinderDisabled,
+                targetFpsFloat = s.videoFpsFloat
+            )
 
             AutomationEngine.programNativeBridge(config)
 
@@ -1228,8 +1276,8 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
                     videoTimerJob?.cancel()
                     videoTimerJob = null
                     AutomationEngine.stopNativeBridge()
+                    repository.stopVideoRecording()
                     withContext(Dispatchers.Main) {
-                        repository.stopVideoRecording()
                         CommixHaptics.heavy(getApplication(), _uiState.value.hapticsEnabled)
                     }
                     _uiState.update {

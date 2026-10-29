@@ -55,6 +55,16 @@ object NativeEngineBridge {
         frameRate: Double
     ): Boolean
 
+    @JvmStatic
+    external fun nativePushImuSample(
+        timestampNs: Long,
+        gx: Float,
+        gy: Float,
+        gz: Float,
+        ax: Float,
+        ay: Float,
+        az: Float
+    )
 
     @JvmStatic
     external fun nativePushBestShotVelocity(gx: Float, gy: Float, gz: Float)
@@ -101,4 +111,3 @@ object NativeEngineBridge {
         outValues: FloatArray
     ): Boolean
 }
-

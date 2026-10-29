@@ -9,7 +9,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "org.codeaurora.snapcam"
+        applicationId = "com.txor.commix"
         minSdk = 28
         targetSdk = 35
         versionCode = 15
@@ -42,6 +42,20 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val storeFilePath = System.getenv("SIGNING_STORE_FILE") ?: System.getenv("KEYSTORE_PATH")
+            if (storeFilePath != null && file(storeFilePath).exists()) {
+                storeFile = file(storeFilePath)
+                storePassword = System.getenv("SIGNING_STORE_PASSWORD") ?: System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("SIGNING_KEY_ALIAS") ?: System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("SIGNING_KEY_PASSWORD") ?: System.getenv("KEY_PASSWORD")
+            } else {
+                initWith(getByName("debug"))
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -50,7 +64,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
         debug {
             isMinifyEnabled = false
@@ -138,21 +152,50 @@ dependencies {
 
 tasks.register<Exec>("testNative") {
     group = "verification"
-    description = "Compiles and executes the bare-metal C++20 Aether engine verification suite."
+    description = "Compiles and executes the C++20 Aether engine suite plus the JNI boundary suite."
     workingDir = projectDir
     commandLine(
         "bash", "-c",
         """
-        mkdir -p build/test-native && \
-        g++ -std=c++20 -Wall -Wextra -Werror \
+        set -e
+        mkdir -p build/test-native
+
+        # Host warning flags mirror app/src/main/cpp/CMakeLists.txt (-Wall -Wextra)
+        # and include the same -Wno-unused-parameter the NDK build uses, so the
+        # suite compiles the shipped sources under the shipped warning policy.
+
+        # 1) Engine suite: every engine source except jni_bridge.cpp.
+        g++ -std=c++20 -Wall -Wextra -Werror -Wno-unused-parameter \
           src/test/cpp/native_engine_test.cpp \
           src/main/cpp/computational_photo.cpp \
           src/main/cpp/stabilization_engine.cpp \
+          src/main/cpp/color_science.cpp \
+          src/main/cpp/image_pipeline.cpp \
           src/main/cpp/scopes_engine.cpp \
           src/main/cpp/best_shot_engine.cpp \
           src/main/cpp/keyframe_engine.cpp \
           src/main/cpp/commix_telemetry.cpp \
-          -lpthread -lm -o build/test-native/native_engine_test && ./build/test-native/native_engine_test
+          -lpthread -lm -o build/test-native/native_engine_test
+        ./build/test-native/native_engine_test
+
+        # 2) JNI boundary suite: jni_bridge.cpp is #included verbatim into this test
+        #    translation unit (its entry points are static) and compiled against the
+        #    host stubs in src/test/cpp/jni_stubs. It must NOT also be listed as a
+        #    source here - a second copy would collide at link time. Same engine
+        #    sources provide the symbols its natives call.
+        g++ -std=c++20 -Wall -Wextra -Werror -Wno-unused-parameter \
+          -I src/test/cpp -I src/test/cpp/jni_stubs \
+          src/test/cpp/jni_bridge_test.cpp \
+          src/main/cpp/computational_photo.cpp \
+          src/main/cpp/stabilization_engine.cpp \
+          src/main/cpp/color_science.cpp \
+          src/main/cpp/image_pipeline.cpp \
+          src/main/cpp/scopes_engine.cpp \
+          src/main/cpp/best_shot_engine.cpp \
+          src/main/cpp/keyframe_engine.cpp \
+          src/main/cpp/commix_telemetry.cpp \
+          -lpthread -lm -o build/test-native/jni_bridge_test
+        ./build/test-native/jni_bridge_test
         """.trimIndent()
     )
 }

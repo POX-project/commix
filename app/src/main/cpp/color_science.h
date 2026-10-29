@@ -11,6 +11,7 @@ enum class TransferCurveType {
     ArriLogC3,
     ArriLogC4,
     SonySLog3,
+    SLog3 = SonySLog3,
     CanonCLog2,
     RedLog3G10,
     Hlg,

@@ -15,7 +15,7 @@ import com.txor.commix.ui.theme.*
 
 /**
  * High-performance hardware-accelerated scopes, rule-of-thirds grid,
- * and pitch/roll horizon leveler matching Flutter's cinema_tools.dart.
+ * pitch/roll horizon leveler, and chroma polar vectorscope.
  */
 @Composable
 fun ScopesOverlay(
@@ -23,10 +23,13 @@ fun ScopesOverlay(
     showHistogram: Boolean,
     showHorizon: Boolean,
     showGrid: Boolean,
+    showVectorscope: Boolean = false,
     rollDeg: Float = 0f,
     pitchDeg: Float = 0f,
     waveformCols: FloatArray = FloatArray(0),
     lumaHistogram: IntArray = IntArray(0),
+    vectorscopeSamples: FloatArray = FloatArray(0),
+    vectorscopeCount: Int = 0,
     modifier: Modifier = Modifier
 ) {
     val wavePath = remember { Path() }
@@ -177,6 +180,95 @@ fun ScopesOverlay(
             drawPath(histPath, color = Color(0x66FFCC00))
             drawPath(histPath, color = AppleYellow, style = Stroke(width = 1.5f))
         }
+
+        // 5. Broadcast Chroma Vectorscope (Top-left polar reticle)
+        if (showVectorscope) {
+            val vScopeSize = 120f
+            val vScopeX = 16f
+            val vScopeY = 70f
+            val vScopeCenterX = vScopeX + vScopeSize / 2f
+            val vScopeCenterY = vScopeY + vScopeSize / 2f
+            val maxRadius = (vScopeSize / 2f) - 6f // ~54f
+
+            // Background circular dial
+            drawCircle(
+                color = Color(0xCC05080A),
+                radius = vScopeSize / 2f,
+                center = Offset(vScopeCenterX, vScopeCenterY)
+            )
+
+            // Outer 100% saturation ring
+            drawCircle(
+                color = Color(0x44FFFFFF),
+                radius = maxRadius,
+                center = Offset(vScopeCenterX, vScopeCenterY),
+                style = Stroke(width = 1f)
+            )
+
+            // Inner 75% saturation ring (broadcast standard)
+            val r75 = maxRadius * 0.75f
+            drawCircle(
+                color = Color(0x3300E676),
+                radius = r75,
+                center = Offset(vScopeCenterX, vScopeCenterY),
+                style = Stroke(width = 1f)
+            )
+
+            // U (B-Y) and V (R-Y) Axis crosshairs
+            drawLine(
+                color = Color(0x33FFFFFF),
+                start = Offset(vScopeCenterX - maxRadius, vScopeCenterY),
+                end = Offset(vScopeCenterX + maxRadius, vScopeCenterY),
+                strokeWidth = 1f
+            )
+            drawLine(
+                color = Color(0x33FFFFFF),
+                start = Offset(vScopeCenterX, vScopeCenterY - maxRadius),
+                end = Offset(vScopeCenterX, vScopeCenterY + maxRadius),
+                strokeWidth = 1f
+            )
+
+            // Center target dot
+            drawCircle(
+                color = Color(0x66FFFFFF),
+                radius = 2f,
+                center = Offset(vScopeCenterX, vScopeCenterY)
+            )
+
+            // Standard 75% Chroma Target Boxes (R, Mg, B, Cy, G, Yl)
+            val targetBoxes = listOf(
+                Pair(-0.29f, 0.61f) to Color(0xFFFF5252),  // Red
+                Pair(0.35f, 0.61f) to Color(0xFFE040FB),   // Magenta
+                Pair(0.64f, -0.15f) to Color(0xFF448AFF),  // Blue
+                Pair(0.29f, -0.61f) to Color(0xFF18FFFF),  // Cyan
+                Pair(-0.35f, -0.61f) to Color(0xFF69F0AE), // Green
+                Pair(-0.64f, 0.15f) to Color(0xFFFFD740)   // Yellow
+            )
+
+            for ((coord, color) in targetBoxes) {
+                val tx = vScopeCenterX + coord.first * maxRadius
+                val ty = vScopeCenterY - coord.second * maxRadius // V inverted for screen space
+                drawRect(
+                    color = color.copy(alpha = 0.8f),
+                    topLeft = Offset(tx - 3f, ty - 3f),
+                    size = Size(6f, 6f),
+                    style = Stroke(width = 1f)
+                )
+            }
+
+            // Render live U/V chroma scatter cloud
+            val count = vectorscopeCount.coerceIn(0, vectorscopeSamples.size / 2)
+            for (i in 0 until count) {
+                val u = vectorscopeSamples[i * 2]
+                val v = vectorscopeSamples[i * 2 + 1]
+                val px = vScopeCenterX + u * maxRadius
+                val py = vScopeCenterY - v * maxRadius
+                drawCircle(
+                    color = CinemaGreen.copy(alpha = 0.7f),
+                    radius = 1.5f,
+                    center = Offset(px, py)
+                )
+            }
+        }
     }
 }
-

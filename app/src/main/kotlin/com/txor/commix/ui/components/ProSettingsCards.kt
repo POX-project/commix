@@ -82,6 +82,8 @@ fun ProSettingsCards(
     onToggleHistogram: () -> Unit = {},
     showWaveform: Boolean = false,
     onToggleWaveform: () -> Unit = {},
+    showVectorscope: Boolean = false,
+    onToggleVectorscope: () -> Unit = {},
     showHorizon: Boolean = false,
     onToggleHorizon: () -> Unit = {},
     showGrid: Boolean = false,
@@ -869,6 +871,7 @@ fun ProSettingsCards(
                     ) {
                         item { ScopeTogglePill(name = "HISTOGRAM", active = showHistogram, onToggle = onToggleHistogram) }
                         item { ScopeTogglePill(name = "WAVEFORM", active = showWaveform, onToggle = onToggleWaveform) }
+                        item { ScopeTogglePill(name = "V-SCOPE", active = showVectorscope, onToggle = onToggleVectorscope) }
                         item { ScopeTogglePill(name = "HORIZON", active = showHorizon, onToggle = onToggleHorizon) }
                         item { ScopeTogglePill(name = "GRID", active = showGrid, onToggle = onToggleGrid) }
                         item { ScopeTogglePill(name = "SLATE", active = false, onToggle = onOpenSlate) }

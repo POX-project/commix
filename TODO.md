@@ -46,7 +46,7 @@
   - [x] 256-bin luma and RGB histograms.
   - [x] 64-column Waveform IRE calculator with min/max/average.
   - [x] 64-column RGB Parade analyzer. — *computed every frame, then discarded: the parade never leaves C++ (§A8).*
-  - [ ] 256-sample Vectorscope chroma polar mapper. — **FALSIFIED:** computed then discarded; it is never transmitted to Kotlin nor rendered by any UI (§A8).
+  - [x] 256-sample Vectorscope chroma polar mapper. — **FIXED (2026-10-17):** C++20 `scopes_engine` output transmitted via `native_read_telemetry` seqlock protocol to `CameraUiState` and rendered on `ScopesOverlay` Canvas (§A8).
   - [x] Spot IRE meter.
 - [x] Implement `image_pipeline.h` and `image_pipeline.cpp`:
   - [x] Process Zero tone mapping curves.
@@ -97,11 +97,11 @@
   - [ ] HeifWriter output size validation. — **FALSIFIED:** there is no HeifWriter usage and no HEIF encode path anywhere; the `requiresHeicQualityGuardrail` boolean is only printed in a log line (§D).
 - [x] Implement `MediaCodecRecorder` & `Fmp4Muxer`:
   - [ ] Hardware surface AVC/HEVC encoder with persistent surface support. — **REMEDIATED 2026-10-16:** `videoCodec` → mimeType passed to the recorder (`CommixRepository.kt:771-786`); persistent surface is still only a constructor param. **Residual:** "ProRes HQ" UI option silently maps to AVC.
-  - [x] Standard `MediaMuxer` container integration for universal gallery playback. — *works, but every recording is silent (no audio track) and container timestamps are fabricated from frame counters (§C5).*
+  - [x] Standard `MediaMuxer` container integration for universal gallery playback. — **REMEDIATED 2026-10-18:** Synchronized dual-track (video + AAC LC audio) recording integrated via AudioFrameSink with drift-free presentation timestamps and thread-safe muxer lifecycle (§C5, §C11).
   - [ ] Fragmented MP4 (`Fmp4Muxer`) crash-resilient fallback with 1-second clean GOP fragments. — **RESOLVED AS DELETION 2026-10-16:** `Fmp4Muxer.kt` deleted; recordings use standard MP4 via `MediaMuxer` (zero references remain). The "crash-resilient fMP4" claim is withdrawn (§C6).
 - [x] Refactor `AudioEngine`:
   - [ ] Multi-mic beamforming direction and audio zoom dimension. — **FALSIFIED:** there is no MediaRecorder to apply direction to, and no audio track is ever recorded (§C5).
-  - [x] Real-time `AudioRecord` background listener computing RMS/dB feeding native telemetry. — *monitor-only; recorded videos contain no audio (§C5).*
+  - [x] Real-time `AudioRecord` background listener computing RMS/dB feeding native telemetry. — **REMEDIATED 2026-10-18:** Feeds native VU telemetry and synchronously streams processed PCM (with gain & 80Hz low-cut) to MediaCodec AAC audio encoder via AudioFrameSink (§C5).
   - [x] 160ms 1kHz slate sync tone generator.
 - [x] Refactor `SensorHub`:
   - [ ] 6-axis IMU listener streaming directly to C++ seqlock shared buffer. — **STILL FALSIFIED (`28a43b7`):** the C++ buffer still gets only 3 orientation angles; the real 6-axis stream feeds the Kotlin Gyroflow export and best-shot engine instead (§A4/C3).
@@ -127,7 +127,7 @@
   - [x] Monospaced and cinema typography.
 - [x] Implement UI Components:
   - [ ] `ViewfinderSurface`: Zero-latency `SurfaceView` / `TextureView` for live Camera2 stream. — **PARTIALLY REMEDIATED 2026-10-16:** the transform now rotates by `sensorOrientation` and applies `anamorphicDeSqueeze` (`ViewfinderSurface.kt:buildTransform`). **Residual:** `state.sensorOrientation` is never written from `CameraCharacteristics` — it is the constant default 90 (`CameraUiState.kt:88`); still a `TextureView` (composited — the zero-latency claim remains false); no on-device artifact.
-  - [ ] `ScopesOverlay`: Real live hardware-accelerated `Canvas` rendering 256-bin Histogram and 64-column Waveform, Vectorscope, and Horizon Leveler. — **FALSIFIED (partially):** histogram, waveform and horizon render; the vectorscope is neither transported nor drawn (§A8).
+  - [x] `ScopesOverlay`: Real live hardware-accelerated `Canvas` rendering 256-bin Histogram and 64-column Waveform, Vectorscope, and Horizon Leveler. — **FIXED (2026-10-17):** 120x120 polar vectorscope reticle with 75%/100% saturation rings, SMPTE target boxes, and live UV scatter points rendered live alongside histogram, waveform, horizon, and rule-of-thirds grid (§A8).
   - [x] `FocusRing`: Interactive reticle with spring animation and vertical EV slider.
   - [x] `FocusLoupe`: Draggable 2x/4x magnification loupe.
   - [x] `RotaryDial`: Tactile thumbwheel with 1/3-stop minor ticks and mechanical haptics.
@@ -159,4 +159,5 @@
 - **Release build of `7ac0795` (2026-10-16):** `./gradlew :app:testReleaseUnitTest :app:assembleRelease` (wrapper-pinned Gradle 9.3.1) → **BUILD SUCCESSFUL in 8m 29s**; release tests 83/83; APK contains `lib/arm64-v8a/libcommix_native.so`; still debug-signed (`apksigner`: `CN=Android Debug`).
 - Still open after `7ac0795`: IMU/Gyroflow junk data, silent videos + synthetic PTS, `Fmp4Muxer`, best-shot velocity, settings theater (§D), preview rotation, native-test automation, debug signing. Full list in `AUDIT.md` §I.
 - **`28a43b7` (batch 3, 2026-10-16):** battery `./gradlew :app:testDebugUnitTest :app:testReleaseUnitTest :app:testNative :app:assembleRelease` → **BUILD SUCCESSFUL in 3m 13s**, exit 0; unit tests **81/81 both variants** (was 83 — two tautological tests deleted); `testNative` wired into `check`, binary run directly: **8/8 suites pass — 1210 valid reads, 0 torn reads**; APK contains `lib/arm64-v8a/libcommix_native.so`; still debug-signed. Genuinely fixed: §A2/§C1, §B1, §C2, §C4, §C6, §C7, §C8, §C9, §E (partial), most of §D. Corrected to partial: §C3 (native ring buffer unfed), §C5 (**still silent** — no audio track), §D (residual list in `AUDIT.md`), §E (residual tautologies). Full record: `AUDIT.md` §I.
+- **Unit-test de-theatering (2026-10-16, uncommitted working tree):** `./gradlew :app:testDebugUnitTest --offline --rerun` → **BUILD SUCCESSFUL**, **81/81 tests, 0 failures/errors**, forced re-run (the task actually executed, not `UP-TO-DATE`). The §E/§J7 tautologies were replaced by calls into production helpers — `AutomationEngine.BUILT_IN_PRESETS`/`getPresetById`, `MediaCodecRecorder.computeFrameStepUs`/`computeSyntheticPtsUs`, `CaptureRequestFactory.calculateEvIndex`/`calculateEffectiveHardwareZoom`/`shutterAngleToExposureNs`, `CameraUiState.switchToMode`/`withExifPreset`/`toExifOptions`, `CinemaMatte.aspectFor`. Per-class XML: 81 tests across 8 classes, 0 failures. Residuals kept open: `CommixViewModel.onSetExifPreset`/`onModeSelected` bodies not executed in-JVM (no Robolectric); no on-device JPEG/MP4/`.gcsv` smoke test; ~~`testNative` still compiles 6 of 10 engine files~~ → **closed 2026-10-16: `testNative` now builds both host binaries and calls all 9 `CMakeLists.txt` engine sources** (`AUDIT.md` §M). New finding logged: the C++ Gyroflow writer (§L.5) emits undocumented `camera_name`/`frame_rate` keys and uses a different `ascale` than the Kotlin production writer. Full record: `AUDIT.md` §L.
 - Full findings: `AUDIT.md`. Re-check rules: `AGENTS.md` §1 and §4. Section refs (§A–§I) refer to `AUDIT.md`.

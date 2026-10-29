@@ -39,8 +39,8 @@ object NativeTelemetryBridge {
     @JvmStatic
     external fun nativeReadTelemetry(
         outFloats: FloatArray,
-        outLumaBins: IntArray,
-        outWaveCols: FloatArray
+        outLumaBins: IntArray?,
+        outWaveCols: FloatArray?,
+        outVscope: FloatArray?
     ): Boolean
 }
-

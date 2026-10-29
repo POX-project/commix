@@ -1,12 +1,18 @@
 package com.txor.commix.data
 
 import android.annotation.SuppressLint
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.MeteringRectangle
 import android.media.Image
@@ -53,8 +59,10 @@ class CommixRepository(private val context: Context) {
 
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
+    @Volatile private var activeCameraId: String? = null
 
     private var previewSurface: Surface? = null
+    private var previewSurfaceTexture: SurfaceTexture? = null
     private var analysisReader: ImageReader? = null
     private var stillReader: ImageReader? = null
     private var videoRecorder: CommixRecordingEngine? = null
@@ -102,10 +110,13 @@ class CommixRepository(private val context: Context) {
         thermalManager.startMonitoring()
         sensorHub.startOrientationUpdates()
         NativeEngineBridge.nativeInitEngine()
+        ioScope.launch {
+            cleanupOrphanPendingRowsAndFiles()
+        }
     }
 
     private fun startCameraThread() {
-        if (cameraThread == null) {
+        if (cameraThread == null || cameraThread?.isAlive == false) {
             cameraThread = HandlerThread("CommixCameraThread").apply {
                 start()
                 cameraHandler = Handler(looper)
@@ -205,6 +216,8 @@ class CommixRepository(private val context: Context) {
 
         // 6. Universal video standards that physically fit inside this sensor
         val candidateStandards = listOf(
+            android.util.Size(8192, 4320), // 8K DCI
+            android.util.Size(7680, 4320), // 8K UHD
             android.util.Size(4096, 2160), // 4K DCI
             android.util.Size(3840, 2160), // 4K UHD
             android.util.Size(2560, 1440), // 1440p QHD
@@ -342,25 +355,73 @@ class CommixRepository(private val context: Context) {
         }
     }
 
-    @SuppressLint("MissingPermission")
-    fun onSurfaceDestroyed() {
-        previewSurface = null
-        try {
-            sessionManager.activeSession?.stopRepeating()
-        } catch (_: Exception) {}
-        if (sessionManager.state == CameraState.ACTIVE_PREVIEW) {
-            sessionManager.transitionTo(CameraState.OPENED)
+    fun pauseCamera() {
+        Log.d(TAG, "pauseCamera() - releasing camera session and device for background")
+        if (isRecordingVideo) {
+            try { stopVideoRecording() } catch (_: Exception) {}
+        }
+        sensorHub.stopOrientationUpdates()
+        thermalManager.stopMonitoring()
+
+        val handler = cameraHandler
+        if (handler != null) {
+            handler.post {
+                sessionManager.release()
+                try { analysisReader?.close() } catch (_: Exception) {}
+                analysisReader = null
+                try { stillReader?.close() } catch (_: Exception) {}
+                stillReader = null
+                previewSurface = null
+                previewSurfaceTexture = null
+            }
+        } else {
+            sessionManager.release()
+            try { analysisReader?.close() } catch (_: Exception) {}
+            analysisReader = null
+            try { stillReader?.close() } catch (_: Exception) {}
+            stillReader = null
+            previewSurface = null
+            previewSurfaceTexture = null
         }
     }
 
-    fun openCamera(cameraId: String, surface: Surface, onReady: () -> Unit) {
+    fun resumeCamera() {
+        Log.d(TAG, "resumeCamera() - restoring camera threads and sensors for foreground")
+        startCameraThread()
+        sensorHub.startOrientationUpdates()
+        thermalManager.startMonitoring()
+    }
+
+    @SuppressLint("MissingPermission")
+    fun onSurfaceDestroyed() {
+        pauseCamera()
+    }
+
+    fun openCamera(
+        cameraId: String,
+        surface: Surface,
+        surfaceTexture: SurfaceTexture? = null,
+        retryCount: Int = 0,
+        onReady: () -> Unit
+    ) {
         val handler = cameraHandler ?: return
         previewSurface = surface
+        if (surfaceTexture != null) {
+            previewSurfaceTexture = surfaceTexture
+        }
+        activeCameraId = cameraId
 
         val existingDevice = sessionManager.activeDevice
         if (sessionManager.activeCameraId == cameraId && existingDevice != null) {
+            if (sessionManager.state == CameraState.ACTIVE_PREVIEW && previewSurface == surface && surface.isValid) {
+                Log.d(TAG, "Camera $cameraId already active on surface, skipping redundant configure.")
+                onReady()
+                return
+            }
             Log.d(TAG, "Camera $cameraId device already open, reconfiguring session for surface.")
-            configureSession(existingDevice, surface, onReady)
+            handler.post {
+                configureSession(existingDevice, surface, onReady)
+            }
             return
         }
 
@@ -374,7 +435,7 @@ class CommixRepository(private val context: Context) {
             }
 
             // Yield briefly to let cameraserver cleanly finalize hardware disconnect
-            try { Thread.sleep(75) } catch (_: Exception) {}
+            try { Thread.sleep(100) } catch (_: Exception) {}
 
             sessionManager.transitionTo(CameraState.OPENING)
             activeCharacteristics = try {
@@ -389,6 +450,11 @@ class CommixRepository(private val context: Context) {
             try {
                 cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
+                        if (activeCameraId != null && activeCameraId != cameraId) {
+                            Log.w(TAG, "Stale camera $cameraId opened while target is $activeCameraId; closing.")
+                            try { camera.close() } catch (_: Exception) {}
+                            return
+                        }
                         sessionManager.activeDevice = camera
                         sessionManager.activeCameraId = cameraId
                         sessionManager.transitionTo(CameraState.OPENED)
@@ -400,14 +466,49 @@ class CommixRepository(private val context: Context) {
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
-                        Log.e(TAG, "Camera open error: $error")
+                        Log.e(TAG, "Camera open error: $error for camera $cameraId (retryCount=$retryCount)")
                         try { camera.close() } catch (_: Exception) {}
                         sessionManager.release()
+
+                        val isTransient = (error == CameraDevice.StateCallback.ERROR_CAMERA_IN_USE ||
+                                           error == CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE)
+                        if (isTransient && retryCount < 3) {
+                            Log.i(TAG, "Transient hardware lock on camera $cameraId. Retrying in ${150 * (retryCount + 1)}ms...")
+                            handler.postDelayed({
+                                openCamera(cameraId, surface, surfaceTexture, retryCount + 1, onReady)
+                            }, (150L * (retryCount + 1)))
+                            return
+                        }
+
+                        // Auto-recovery: if an auxiliary lens permanently fails to open, fall back to the primary camera
+                        val primaryCamId = getProbedCameras().firstOrNull { !it.isFront && !it.isMacro && !it.isUltraWide && !it.isDepth }?.cameraId ?: "0"
+                        if (cameraId != primaryCamId && retryCount >= 1) {
+                            Log.w(TAG, "Auxiliary camera $cameraId failed with error $error. Falling back to primary camera $primaryCamId")
+                            handler.postDelayed({
+                                openCamera(primaryCamId, surface, surfaceTexture, 0, onReady)
+                            }, 100)
+                            return
+                        }
+
                         onError?.invoke("Camera hardware error ($error)")
                     }
                 }, handler)
             } catch (e: Exception) {
                 Log.e(TAG, "Exception opening camera: ${e.message}", e)
+                sessionManager.release()
+                if (retryCount < 2) {
+                    handler.postDelayed({
+                        openCamera(cameraId, surface, surfaceTexture, retryCount + 1, onReady)
+                    }, 150)
+                    return@post
+                }
+                val primaryCamId = getProbedCameras().firstOrNull { !it.isFront && !it.isMacro && !it.isUltraWide && !it.isDepth }?.cameraId ?: "0"
+                if (cameraId != primaryCamId) {
+                    handler.postDelayed({
+                        openCamera(primaryCamId, surface, surfaceTexture, 0, onReady)
+                    }, 100)
+                    return@post
+                }
                 sessionManager.forceState(CameraState.ERROR)
                 onError?.invoke("Failed to open camera: ${e.message}")
             }
@@ -420,109 +521,149 @@ class CommixRepository(private val context: Context) {
 
         val map = activeCharacteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
-        // Setup Still Capture ImageReader with actual supported JPEG size
+        // 1. Gather all actual supported JPEG sizes strictly from camera characteristics
         stillReader?.close()
+        stillReader = null
+        val mapJpegSizes = map?.getOutputSizes(ImageFormat.JPEG)?.toList() ?: emptyList()
+        val highResJpegSizes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try { map?.getHighResolutionOutputSizes(ImageFormat.JPEG)?.toList() ?: emptyList() } catch (_: Throwable) { emptyList() }
+        } else emptyList()
         val probed = getProbedCameras().find { it.cameraId == (sessionManager.activeCameraId ?: camera.id) }
-        val supportedSizes = probed?.supportedJpegSizes?.takeIf { it.isNotEmpty() }
-            ?: map?.getOutputSizes(ImageFormat.JPEG)?.toList()
-            ?: emptyList()
+        val probedSupported = probed?.supportedJpegSizes ?: emptyList()
+        val supportedJpegSizes = (mapJpegSizes + highResJpegSizes + probedSupported)
+            .filter { it.width > 0 && it.height > 0 }
+            .distinctBy { it.width.toLong() * it.height.toLong() }
+            .sortedByDescending { it.width.toLong() * it.height.toLong() }
+
         val targetMpPixels = currentParams.targetPhotoMp * 1_000_000.0
-        val targetJpeg = if (targetMpPixels > 0.0) {
-            supportedSizes.minByOrNull { kotlin.math.abs((it.width.toDouble() * it.height.toDouble()) - targetMpPixels) }
-                ?: supportedSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
-                ?: Size(1920, 1080)
+        val targetJpeg = if (supportedJpegSizes.isNotEmpty()) {
+            if (targetMpPixels > 0.0) {
+                supportedJpegSizes.minByOrNull { kotlin.math.abs((it.width.toDouble() * it.height.toDouble()) - targetMpPixels) }
+                    ?: supportedJpegSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                    ?: supportedJpegSizes.first()
+            } else {
+                supportedJpegSizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: supportedJpegSizes.first()
+            }
         } else {
-            supportedSizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: Size(1920, 1080)
+            null
         }
 
-        stillReader = ImageReader.newInstance(targetJpeg.width, targetJpeg.height, ImageFormat.JPEG, 8).apply {
-            setOnImageAvailableListener({ reader ->
-                val img = try { reader.acquireNextImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
-                val bytes = try {
-                    val buffer = img.planes[0].buffer
-                    val b = ByteArray(buffer.remaining())
-                    buffer.get(b)
-                    b
-                } finally {
-                    img.close()
-                }
+        if (targetJpeg != null) {
+            try {
+                stillReader = ImageReader.newInstance(targetJpeg.width, targetJpeg.height, ImageFormat.JPEG, 2).apply {
+                    setOnImageAvailableListener({ reader ->
+                        val img = try { reader.acquireNextImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
+                        val bytes = try {
+                            val buffer = img.planes[0].buffer
+                            val b = ByteArray(buffer.remaining())
+                            buffer.get(b)
+                            b
+                        } finally {
+                            img.close()
+                        }
 
-                if (isNightBurstActive) {
-                    synchronized(nightBurstCollector) {
-                        nightBurstCollector.add(bytes)
-                    }
-                } else if (isPanoramaActive) {
-                    synchronized(panoramaSliceCollector) {
-                        panoramaSliceCollector.add(bytes)
-                    }
-                    onPanoramaSliceCaptured?.invoke(bytes)
-                } else {
-                    ioScope.launch {
-                        val processed = processToneAndGrain(bytes)
-                        saveStillBytes(processed, isNight = false)
-                    }
+                        if (isNightBurstActive) {
+                            synchronized(nightBurstCollector) {
+                                nightBurstCollector.add(bytes)
+                            }
+                        } else if (isPanoramaActive) {
+                            synchronized(panoramaSliceCollector) {
+                                panoramaSliceCollector.add(bytes)
+                            }
+                            onPanoramaSliceCaptured?.invoke(bytes)
+                        } else {
+                            ioScope.launch {
+                                val processed = processToneAndGrain(bytes)
+                                saveStillBytes(processed, isNight = false)
+                            }
+                        }
+                    }, handler)
                 }
-            }, handler)
+            } catch (e: Exception) {
+                Log.w(TAG, "stillReader creation failed for ${targetJpeg.width}x${targetJpeg.height}: ${e.message}")
+            }
         }
 
-        // Setup YUV analysis reader for real-time scopes
+        // 2. Setup YUV analysis reader strictly from active camera's supported YUV sizes
         analysisReader?.close()
         analysisReader = null
-        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
-        val chosenYuv = yuvSizes.filter { it.width in 160..640 && it.height in 90..480 }
-            .minByOrNull { it.width * it.height } ?: Size(320, 240)
-
-        try {
-            analysisReader = ImageReader.newInstance(chosenYuv.width, chosenYuv.height, ImageFormat.YUV_420_888, 2).apply {
-                setOnImageAvailableListener({ reader ->
-                    val img = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
-                    try {
-                        processAnalysisFrame(img)
-                    } finally {
-                        img.close()
+        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888)?.toList() ?: emptyList()
+        if (yuvSizes.isNotEmpty()) {
+            val chosenYuv = yuvSizes.filter { it.width in 160..640 && it.height in 90..480 }
+                .minByOrNull { it.width * it.height }
+                ?: yuvSizes.minByOrNull { it.width * it.height }
+            if (chosenYuv != null) {
+                try {
+                    analysisReader = ImageReader.newInstance(chosenYuv.width, chosenYuv.height, ImageFormat.YUV_420_888, 2).apply {
+                        setOnImageAvailableListener({ reader ->
+                            val img = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
+                            try {
+                                processAnalysisFrame(img)
+                            } finally {
+                                img.close()
+                            }
+                        }, handler)
                     }
-                }, handler)
+                } catch (e: Exception) {
+                    Log.w(TAG, "analysisReader creation failed: ${e.message}")
+                }
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "analysisReader creation failed: ${e.message}")
         }
 
-        // Dynamically compute preview resolution matching active capture aspect ratio
+        // 3. Dynamically compute preview resolution strictly from active camera's SurfaceTexture supported sizes
         val isVideo = currentParams.activeMode in listOf("VIDEO", "CINEMATIC", "SLOW-MO", "TIME-LAPSE")
         val videoParts = currentParams.videoResolution.split("x")
         val videoW = videoParts.firstOrNull()?.toIntOrNull() ?: 1920
         val videoH = videoParts.lastOrNull()?.toIntOrNull() ?: 1080
 
-        val captureW = if (isVideo) videoW else targetJpeg.width
-        val captureH = if (isVideo) videoH else targetJpeg.height
-        val targetAspect = captureW.toFloat() / captureH.toFloat()
+        val captureW = if (isVideo) videoW else (targetJpeg?.width ?: 4)
+        val captureH = if (isVideo) videoH else (targetJpeg?.height ?: 3)
+        val targetAspect = if (captureH > 0) captureW.toFloat() / captureH.toFloat() else (4f / 3f)
 
         val stSizes = map?.getOutputSizes(android.graphics.SurfaceTexture::class.java)?.toList() ?: emptyList()
         val matchingStSizes = stSizes.filter { size ->
             val r = size.width.toFloat() / size.height.toFloat()
-            kotlin.math.abs(r - targetAspect) < 0.03f
+            kotlin.math.abs(r - targetAspect) < 0.05f
         }
 
-        val optimalPreview = matchingStSizes.filter { it.width <= 2048 && it.height <= 1536 }
+        val optimalPreview = matchingStSizes.filter { it.width <= 1920 && it.height <= 1440 }
             .maxByOrNull { it.width.toLong() * it.height.toLong() }
             ?: matchingStSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
             ?: stSizes.minByOrNull { size ->
                 val r = size.width.toFloat() / size.height.toFloat()
                 kotlin.math.abs(r - targetAspect)
             }
-            ?: Size(if (isVideo) 1920 else 1440, 1080)
+            ?: stSizes.firstOrNull()
+            ?: Size(1280, 720)
+
+        // Set the default buffer size on SurfaceTexture immediately before session creation
+        previewSurfaceTexture?.setDefaultBufferSize(optimalPreview.width, optimalPreview.height)
+
+        val activePreviewSurface = if (previewSurfaceTexture != null) {
+            Surface(previewSurfaceTexture).also {
+                previewSurface = it
+            }
+        } else {
+            surface
+        }
 
         val portraitAspect = optimalPreview.height.toFloat() / optimalPreview.width.toFloat()
-        val actualPhotoMp = (targetJpeg.width.toDouble() * targetJpeg.height.toDouble()) / 1_000_000.0
+        val actualPhotoMp = if (targetJpeg != null) {
+            (targetJpeg.width.toDouble() * targetJpeg.height.toDouble()) / 1_000_000.0
+        } else {
+            (optimalPreview.width.toDouble() * optimalPreview.height.toDouble()) / 1_000_000.0
+        }
 
         onPreviewSizeConfigured?.invoke(optimalPreview, portraitAspect, actualPhotoMp)
 
         val sessionSurfaces = mutableListOf<Surface>()
-        sessionSurfaces.add(surface)
-        stillReader?.surface?.let { sessionSurfaces.add(it) }
-        analysisReader?.surface?.let { sessionSurfaces.add(it) }
+        if (activePreviewSurface.isValid) {
+            sessionSurfaces.add(activePreviewSurface)
+        }
+        stillReader?.surface?.let { if (it.isValid) sessionSurfaces.add(it) }
+        analysisReader?.surface?.let { if (it.isValid) sessionSurfaces.add(it) }
 
-        createCaptureSessionWithFallback(camera, surface, sessionSurfaces, onReady, allowFallback = true)
+        createCaptureSessionWithFallback(camera, activePreviewSurface, sessionSurfaces, onReady, fallbackLevel = 0)
     }
 
     private fun createCaptureSessionWithFallback(
@@ -530,9 +671,8 @@ class CommixRepository(private val context: Context) {
         surface: Surface,
         surfaces: List<Surface>,
         onReady: () -> Unit,
-        allowFallback: Boolean
+        fallbackLevel: Int = 0
     ) {
-
         val handler = cameraHandler ?: return
         try {
             camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
@@ -568,31 +708,53 @@ class CommixRepository(private val context: Context) {
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                    Log.w(TAG, "Session configuration failed")
+                    Log.w(TAG, "Session configuration failed at fallbackLevel $fallbackLevel")
                     try { session.close() } catch (_: Exception) {}
-                    val currentAnalysis = analysisReader
-                    if (allowFallback && currentAnalysis != null) {
-                        val surfToRemove = currentAnalysis.surface
-                        Log.i(TAG, "Retrying session configuration with minimal surfaces")
-                        try { currentAnalysis.close() } catch (_: Exception) {}
+
+                    if (fallbackLevel == 0) {
+                        // Level 1: Retry without analysisReader (Scopes YUV)
+                        Log.i(TAG, "Retrying session configuration without analysis reader (Level 1)")
+                        try { analysisReader?.close() } catch (_: Exception) {}
                         analysisReader = null
-                        val fallbackSurfaces = surfaces.filter { it != surfToRemove }
-                        createCaptureSessionWithFallback(camera, surface, fallbackSurfaces, onReady, allowFallback = false)
+                        val fallbackSurfaces = mutableListOf<Surface>()
+                        if (surface.isValid) fallbackSurfaces.add(surface)
+                        stillReader?.surface?.let { if (it.isValid) fallbackSurfaces.add(it) }
+                        createCaptureSessionWithFallback(camera, surface, fallbackSurfaces, onReady, fallbackLevel = 1)
                         return
+                    } else if (fallbackLevel == 1) {
+                        // Level 2: Retry with preview surface only (restricted / monochrome / aux lenses)
+                        Log.i(TAG, "Retrying session configuration with preview surface only (Level 2)")
+                        try { stillReader?.close() } catch (_: Exception) {}
+                        stillReader = null
+                        val fallbackSurfaces = if (surface.isValid) listOf(surface) else emptyList()
+                        if (fallbackSurfaces.isNotEmpty()) {
+                            createCaptureSessionWithFallback(camera, surface, fallbackSurfaces, onReady, fallbackLevel = 2)
+                            return
+                        }
                     }
+
                     sessionManager.forceState(CameraState.ERROR)
                     onError?.invoke("Capture session configuration failed")
                 }
             }, handler)
         } catch (e: Exception) {
             Log.e(TAG, "Failed creating capture session: ${e.message}", e)
-            val currentAnalysis = analysisReader
-            if (allowFallback && currentAnalysis != null) {
-                val surfToRemove = currentAnalysis.surface
-                try { currentAnalysis.close() } catch (_: Exception) {}
+            if (fallbackLevel == 0) {
+                try { analysisReader?.close() } catch (_: Exception) {}
                 analysisReader = null
-                val fallbackSurfaces = surfaces.filter { it != surfToRemove }
-                createCaptureSessionWithFallback(camera, surface, fallbackSurfaces, onReady, allowFallback = false)
+                val fallbackSurfaces = mutableListOf<Surface>()
+                if (surface.isValid) fallbackSurfaces.add(surface)
+                stillReader?.surface?.let { if (it.isValid) fallbackSurfaces.add(it) }
+                createCaptureSessionWithFallback(camera, surface, fallbackSurfaces, onReady, fallbackLevel = 1)
+            } else if (fallbackLevel == 1) {
+                try { stillReader?.close() } catch (_: Exception) {}
+                stillReader = null
+                val fallbackSurfaces = if (surface.isValid) listOf(surface) else emptyList()
+                if (fallbackSurfaces.isNotEmpty()) {
+                    createCaptureSessionWithFallback(camera, surface, fallbackSurfaces, onReady, fallbackLevel = 2)
+                } else {
+                    sessionManager.forceState(CameraState.ERROR)
+                }
             } else {
                 sessionManager.forceState(CameraState.ERROR)
             }
@@ -630,11 +792,20 @@ class CommixRepository(private val context: Context) {
             activeRect = params.activeRect ?: activeCharacteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE),
             hasOisHardware = activeCharacteristics?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.any {
                 it == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
-            } == true
+            } == true,
+            availableAntibandingModes = params.availableAntibandingModes
+                ?: activeCharacteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES)
         )
         val oldMode = currentParams.activeMode
         val oldVideoRes = currentParams.videoResolution
         currentParams = enriched
+        audioEngine.setGain(enriched.audioGain)
+        audioEngine.setLowCut(enriched.audioLowCut)
+        if (enriched.adaptivePerformanceEnabled) {
+            thermalManager.startMonitoring()
+        } else {
+            thermalManager.stopMonitoring()
+        }
         applyCaptureParams()
 
         val needsReconfig = (oldMp != enriched.targetPhotoMp || oldMode != enriched.activeMode || oldVideoRes != enriched.videoResolution) && !isRecordingVideo
@@ -651,15 +822,18 @@ class CommixRepository(private val context: Context) {
                         ?.getOutputSizes(ImageFormat.JPEG)?.toList()
                     ?: emptyList()
                 val targetPixels = enriched.targetPhotoMp * 1_000_000.0
-                val newJpeg = if (targetPixels > 0.0) {
-                    supportedSizes.minByOrNull { kotlin.math.abs((it.width.toDouble() * it.height.toDouble()) - targetPixels) }
-                        ?: supportedSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
-                        ?: Size(1920, 1080)
-                } else {
-                    supportedSizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: Size(1920, 1080)
-                }
+                val newJpeg = if (supportedSizes.isNotEmpty()) {
+                    if (targetPixels > 0.0) {
+                        supportedSizes.minByOrNull { kotlin.math.abs((it.width.toDouble() * it.height.toDouble()) - targetPixels) }
+                            ?: supportedSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                            ?: supportedSizes.first()
+                    } else {
+                        supportedSizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: supportedSizes.first()
+                    }
+                } else null
 
-                if (newJpeg.width != currentW || newJpeg.height != currentH || oldMode != enriched.activeMode || oldVideoRes != enriched.videoResolution) {
+                val sizeChanged = newJpeg != null && (newJpeg.width != currentW || newJpeg.height != currentH)
+                if (sizeChanged || oldMode != enriched.activeMode || oldVideoRes != enriched.videoResolution) {
                     configureSession(camera, surface) {}
                 }
             }
@@ -723,11 +897,11 @@ class CommixRepository(private val context: Context) {
         val map = c?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val validCamSizes = map?.getOutputSizes(android.media.MediaRecorder::class.java)?.toList()
             ?: map?.getOutputSizes(android.graphics.SurfaceTexture::class.java)?.toList()
-            ?: listOf(Size(1920, 1080))
+            ?: emptyList()
 
-        // Hardware video encoder bounding box: 4K UHD ceiling (3840x2160 landscape or 2160x3840 portrait)
-        val maxBoxW = if (reqW >= reqH) 3840 else 2160
-        val maxBoxH = if (reqW >= reqH) 2160 else 3840
+        // Hardware video encoder bounding box: 8K UHD ceiling (7680x4320 landscape or 4320x7680 portrait)
+        val maxBoxW = if (reqW >= reqH) 7680 else 4320
+        val maxBoxH = if (reqW >= reqH) 4320 else 7680
         val reqAspect = reqW.toDouble() / reqH.toDouble()
 
         val caps = c?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
@@ -747,7 +921,7 @@ class CommixRepository(private val context: Context) {
                 aspectMatched.sortedByDescending { it.width.toLong() * it.height.toLong() }
                     .ifEmpty { hsSizes.sortedByDescending { it.width.toLong() * it.height.toLong() } }
             }
-            val hsSize = candidateHsSizes.firstOrNull() ?: Size(1280, 720)
+            val hsSize = candidateHsSizes.firstOrNull() ?: hsSizes.firstOrNull() ?: Size(1280, 720)
             val hsRanges = try { map?.getHighSpeedVideoFpsRangesFor(hsSize)?.toList() ?: emptyList() } catch (_: Exception) { emptyList() }
             val chosenRange = hsRanges.filter { it.upper <= targetFps }.maxByOrNull { it.upper }
                 ?: hsRanges.maxByOrNull { it.upper }
@@ -762,7 +936,8 @@ class CommixRepository(private val context: Context) {
                 }
                 aspectMatched.maxByOrNull { it.width.toLong() * it.height.toLong() }
                     ?: encoderFittingSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
-                    ?: Size(1920, 1080)
+                    ?: validCamSizes.firstOrNull()
+                    ?: Size(1280, 720)
             }
             Pair(size, null)
         }
@@ -775,16 +950,40 @@ class CommixRepository(private val context: Context) {
                 android.media.MediaFormat.MIMETYPE_VIDEO_AVC
             }
 
+            val isAllI = bitrate >= 200_000_000 ||
+                          VideoQualityProfile.fromBitrate(bitrate).isAllI ||
+                          currentParams.videoCodec.equals("all_i", ignoreCase = true)
+            val effectiveBitrate = if (isAllI && bitrate < 150_000_000) 150_000_000 else bitrate
+            val iFrameIntervalSec = if (isAllI) 0.0f else 1.0f
+            val isHdr10 = (videoMime == android.media.MediaFormat.MIMETYPE_VIDEO_HEVC) &&
+                          (currentParams.lutLook.contains("hdr", ignoreCase = true) ||
+                           currentParams.toneCurve.contains("hdr", ignoreCase = true) ||
+                           quirks.canSupportDynamicRangeProfiles)
+
+            val shouldRecordAudio = !isSlowMotion
             val recorder = CommixRecordingEngine(
                 outputFile = vidFile,
                 width = bestCamSize.width,
                 height = bestCamSize.height,
                 targetFps = targetFpsFloat,
-                bitrateBps = bitrate,
+                bitrateBps = effectiveBitrate,
                 isSlowMotion = isSlowMotion,
                 playbackFps = playbackFps,
-                mimeType = videoMime
+                mimeType = videoMime,
+                isHdr10 = isHdr10,
+                iFrameIntervalSeconds = iFrameIntervalSec,
+                useSyntheticPts = (targetFpsFloat != 30.0 || isSlowMotion),
+                recordAudio = shouldRecordAudio,
+                audioSampleRate = audioEngine.sampleRate,
+                uncompressedAudio = currentParams.uncompressedAudio
             )
+            if (shouldRecordAudio) {
+                audioEngine.setGain(currentParams.audioGain)
+                audioEngine.setLowCut(currentParams.audioLowCut)
+                audioEngine.audioFrameSink = recorder.audioFrameSink
+            } else {
+                audioEngine.audioFrameSink = null
+            }
             recorder.start()
             val recSurface = recorder.surface ?: throw IllegalStateException("Encoder surface is null")
             videoRecorder = recorder
@@ -859,12 +1058,16 @@ class CommixRepository(private val context: Context) {
                         }
                     }
 
-                    audioEngine.startAudioMonitoring()
+                    if (shouldRecordAudio) {
+                        audioEngine.startAudioMonitoring()
+                    }
                     NativeEngineBridge.nativeStartImuLogging()
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
                     Log.e(TAG, "Video recording session configuration failed")
+                    audioEngine.audioFrameSink = null
+                    audioEngine.stopAudioMonitoring()
                     isRecordingVideo = false
                     try { videoRecorder?.stop() } catch (_: Exception) {}
                     videoRecorder = null
@@ -901,6 +1104,7 @@ class CommixRepository(private val context: Context) {
     fun stopVideoRecording() {
         if (!isRecordingVideo) return
         isRecordingVideo = false
+        audioEngine.audioFrameSink = null
         audioEngine.stopAudioMonitoring()
 
         try {
@@ -947,6 +1151,7 @@ class CommixRepository(private val context: Context) {
 
                 saveVideoToMediaStore(vidFile)
             }
+            cleanupOrphanPendingRowsAndFiles()
         }
 
         if (camera != null && pSurf != null) {
@@ -967,33 +1172,52 @@ class CommixRepository(private val context: Context) {
         val resolver = context.contentResolver
         val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
         if (uri != null) {
-            try {
-                resolver.openOutputStream(uri)?.use { os ->
-                    file.inputStream().use { it.copyTo(os) }
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    values.clear()
-                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
-                }
-                ProcessingJobQueue.instance.enqueueJob(
-                    title = "Gyroflow Stabilization & MP4 Export (${file.name})",
-                    type = ProcessingJobType.VIDEO_STABILIZATION,
-                    sourcePath = file.absolutePath,
-                    outputPath = file.name,
-                    priority = JobPriority.HIGH,
-                    executionBlock = { updateProgress ->
-                        updateProgress(0.5f, "Writing MediaStore records")
-                        updateProgress(1.0f, "Completed")
+            val totalBytes = file.length().coerceAtLeast(1L)
+            ProcessingJobQueue.instance.enqueueJobWithContext(
+                title = "Gyroflow Stabilization & MP4 Export (${file.name})",
+                type = ProcessingJobType.VIDEO_STABILIZATION,
+                sourcePath = file.absolutePath,
+                outputPath = file.name,
+                priority = JobPriority.HIGH,
+                executionBlock = { ctx ->
+                    try {
+                        ctx.updateProgress(0.05f, "Writing MediaStore records...")
+                        resolver.openOutputStream(uri)?.use { os ->
+                            file.inputStream().use { inputStream ->
+                                val buffer = ByteArray(64 * 1024)
+                                var bytesCopied = 0L
+                                var bytesRead = inputStream.read(buffer)
+                                while (bytesRead >= 0) {
+                                    if (ctx.isCancelled) {
+                                        throw kotlinx.coroutines.CancellationException("Video export cancelled by user")
+                                    }
+                                    os.write(buffer, 0, bytesRead)
+                                    bytesCopied += bytesRead
+                                    val progress = 0.05f + (0.90f * (bytesCopied.toFloat() / totalBytes))
+                                    ctx.updateProgress(progress.coerceIn(0.05f, 0.95f), "Exporting MP4 (${bytesCopied / 1024} KB)")
+                                    bytesRead = inputStream.read(buffer)
+                                }
+                                os.flush()
+                            }
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            values.clear()
+                            values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                            resolver.update(uri, values, null, null)
+                        }
+                        ctx.updateProgress(1.0f, "Completed")
+                        onVideoSaved?.invoke(uri)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed writing video to MediaStore", e)
+                        try {
+                            resolver.delete(uri, null, null)
+                        } catch (_: Exception) {}
+                        throw e
+                    } finally {
+                        try { file.delete() } catch (_: Exception) {}
                     }
-                )
-                onVideoSaved?.invoke(uri)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed writing video to MediaStore", e)
-            } finally {
-                // Delete temporary video recording file once stored in MediaStore
-                try { file.delete() } catch (_: Exception) {}
-            }
+                }
+            )
         }
     }
 
@@ -1021,7 +1245,8 @@ class CommixRepository(private val context: Context) {
             val captureBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
                 CaptureRequestFactory.applyControls(this, currentParams)
-                set(CaptureRequest.JPEG_QUALITY, metadata.compressionQuality.toByte())
+                val effectiveQuality = if (PhotoFormatEngine.isLossless(currentParams.photoFormat, metadata.compressionQuality)) 100 else metadata.compressionQuality.coerceIn(1, 100)
+                set(CaptureRequest.JPEG_QUALITY, effectiveQuality.toByte())
                 set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
             }
 
@@ -1075,7 +1300,8 @@ class CommixRepository(private val context: Context) {
                 CaptureRequestFactory.applyControls(this, currentParams)
                 val targetEvIndex = ((currentParams.evStops + offsetEv) / step).toInt()
                 set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, targetEvIndex)
-                set(CaptureRequest.JPEG_QUALITY, metadata.compressionQuality.toByte())
+                val effectiveQuality = if (PhotoFormatEngine.isLossless(currentParams.photoFormat, metadata.compressionQuality)) 100 else metadata.compressionQuality.coerceIn(1, 100)
+                set(CaptureRequest.JPEG_QUALITY, effectiveQuality.toByte())
                 set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
             }.build()
         }
@@ -1128,7 +1354,8 @@ class CommixRepository(private val context: Context) {
             val captureBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
                 CaptureRequestFactory.applyControls(this, currentParams)
-                set(CaptureRequest.JPEG_QUALITY, metadata.compressionQuality.toByte())
+                val effectiveQuality = if (PhotoFormatEngine.isLossless(currentParams.photoFormat, metadata.compressionQuality)) 100 else metadata.compressionQuality.coerceIn(1, 100)
+                set(CaptureRequest.JPEG_QUALITY, effectiveQuality.toByte())
                 set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
             }
 
@@ -1174,7 +1401,8 @@ class CommixRepository(private val context: Context) {
             val req = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
                 CaptureRequestFactory.applyControls(this, currentParams)
-                set(CaptureRequest.JPEG_QUALITY, metadata.compressionQuality.toByte())
+                val effectiveQuality = if (PhotoFormatEngine.isLossless(currentParams.photoFormat, metadata.compressionQuality)) 100 else metadata.compressionQuality.coerceIn(1, 100)
+                set(CaptureRequest.JPEG_QUALITY, effectiveQuality.toByte())
                 set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
             }
             burstRequests.add(req.build())
@@ -1249,6 +1477,7 @@ class CommixRepository(private val context: Context) {
             }
 
             val outBuf = ByteBuffer.allocateDirect(width * height * 4)
+            val deepShadow = currentParams.nightAstroAlignment || currentParams.nightTone != "neutral"
             val success = NativeEngineBridge.nativeStackFramesDirect(
                 frameBuffers.toTypedArray(),
                 frameBuffers.size,
@@ -1256,15 +1485,46 @@ class CommixRepository(private val context: Context) {
                 height,
                 4,
                 outBuf,
-                true // deepShadowBoost
+                deepShadow
             )
 
             if (success) {
                 outBuf.rewind()
                 val compositeBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                 compositeBitmap.copyPixelsFromBuffer(outBuf)
+
+                if (currentParams.nightTone != "neutral") {
+                    val colorFilter = when (currentParams.nightTone.lowercase()) {
+                        "cold" -> ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+                            0.9f, 0f, 0f, 0f, 0f,
+                            0f, 0.95f, 0f, 0f, 0f,
+                            0f, 0f, 1.15f, 0f, 0f,
+                            0f, 0f, 0f, 1f, 0f
+                        )))
+                        "warm" -> ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+                            1.15f, 0f, 0f, 0f, 0f,
+                            0f, 1.05f, 0f, 0f, 0f,
+                            0f, 0f, 0.9f, 0f, 0f,
+                            0f, 0f, 0f, 1f, 0f
+                        )))
+                        "gold" -> ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+                            1.2f, 0f, 0f, 0f, 0f,
+                            0f, 1.1f, 0f, 0f, 0f,
+                            0f, 0f, 0.8f, 0f, 0f,
+                            0f, 0f, 0f, 1f, 0f
+                        )))
+                        else -> null
+                    }
+                    if (colorFilter != null) {
+                        val canvas = Canvas(compositeBitmap)
+                        val paint = Paint().apply { this.colorFilter = colorFilter }
+                        canvas.drawBitmap(compositeBitmap, 0f, 0f, paint)
+                    }
+                }
+
                 val stream = ByteArrayOutputStream()
-                compositeBitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)
+                val effectiveQuality = if (PhotoFormatEngine.isLossless(currentParams.photoFormat, currentParams.photoQuality)) 100 else currentParams.photoQuality.coerceIn(1, 100)
+                PhotoFormatEngine.encodeBitmap(compositeBitmap, currentParams.photoFormat, effectiveQuality, stream)
                 compositeBitmap.recycle()
                 saveStillBytes(stream.toByteArray(), isNight = true)
             } else {
@@ -1338,7 +1598,9 @@ class CommixRepository(private val context: Context) {
                         "8mm" -> 3
                         else -> 0
                     }
-                    NativeEngineBridge.nativeProcessZeroDirect(directBuf, w, h, 4, curveId, grainId, 1.0f)
+                    NativeEngineBridge.nativeProcessZeroDirect(
+                        directBuf, w, h, 4, curveId, grainId, currentParams.processZeroIntensity
+                    )
                     directBuf.rewind()
                 }
 
@@ -1387,12 +1649,8 @@ class CommixRepository(private val context: Context) {
             }
 
             val stream = ByteArrayOutputStream()
-            val format = when (currentParams.photoFormat.lowercase()) {
-                "png" -> Bitmap.CompressFormat.PNG
-                "webp" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
-                else -> Bitmap.CompressFormat.JPEG
-            }
-            mutableBmp.compress(format, 95, stream)
+            val effectiveQuality = if (PhotoFormatEngine.isLossless(currentParams.photoFormat, currentParams.photoQuality)) 100 else currentParams.photoQuality.coerceIn(1, 100)
+            PhotoFormatEngine.encodeBitmap(mutableBmp, currentParams.photoFormat, effectiveQuality, stream)
             mutableBmp.recycle()
             return stream.toByteArray()
         } catch (t: Throwable) {
@@ -1404,28 +1662,22 @@ class CommixRepository(private val context: Context) {
     private fun saveStillBytes(bytes: ByteArray, isNight: Boolean = false) {
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val prefix = if (isNight) "COMMIX_NIGHT_" else "COMMIX_"
-        val ext = when (currentParams.photoFormat.lowercase()) {
-            "png" -> ".png"
-            "webp" -> ".webp"
-            else -> ".jpg"
-        }
-        val mime = when (currentParams.photoFormat.lowercase()) {
-            "png" -> "image/png"
-            "webp" -> "image/webp"
-            else -> "image/jpeg"
-        }
+        val ext = PhotoFormatEngine.getExtension(currentParams.photoFormat)
+        val mime = PhotoFormatEngine.getMimeType(currentParams.photoFormat)
         val fileName = "$prefix$timeStamp$ext"
 
         val tempFile = File(context.cacheDir, "temp_$fileName")
         try {
             tempFile.writeBytes(bytes)
-            if (ext == ".jpg") {
+            if (ext in listOf(".jpg", ".jpeg", ".heic", ".png", ".webp", ".dng")) {
                 val orientation = activeCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
                 val meta = ShotMetadata(
                     timestamp = System.currentTimeMillis(),
                     iso = currentParams.iso.takeIf { it > 0 },
                     exposureTimeNs = currentParams.expNs.takeIf { it > 0L },
-                    activeMode = currentParams.activeMode
+                    activeMode = currentParams.activeMode,
+                    compressionFormat = currentParams.photoFormat,
+                    compressionQuality = if (PhotoFormatEngine.isLossless(currentParams.photoFormat, currentParams.photoQuality)) 100 else currentParams.photoQuality
                 )
                 ExifWriter.writeMetadata(tempFile, orientation, meta, exifOptions)
             }
@@ -1446,37 +1698,56 @@ class CommixRepository(private val context: Context) {
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
 
         if (uri != null) {
-            try {
-                resolver.openOutputStream(uri)?.use { os ->
-                    if (tempFile.exists()) {
-                        tempFile.inputStream().use { it.copyTo(os) }
-                    } else {
-                        os.write(bytes)
+            val jobType = if (isNight) ProcessingJobType.MULTI_EXPOSURE_STACK else ProcessingJobType.SUPER_RES_SYNTHESIS
+            val jobTitle = if (isNight) "Night Burst HDR Fusion ($fileName)" else "Tone Curve & Grain Synthesis ($fileName)"
+            val totalBytes = if (tempFile.exists()) tempFile.length().coerceAtLeast(1L) else bytes.size.toLong().coerceAtLeast(1L)
+
+            ProcessingJobQueue.instance.enqueueJobWithContext(
+                title = jobTitle,
+                type = jobType,
+                outputPath = fileName,
+                priority = JobPriority.NORMAL,
+                executionBlock = { ctx ->
+                    try {
+                        ctx.updateProgress(0.1f, "Writing EXIF & MediaStore records...")
+                        resolver.openOutputStream(uri)?.use { os ->
+                            if (tempFile.exists()) {
+                                tempFile.inputStream().use { inputStream ->
+                                    val buf = ByteArray(32 * 1024)
+                                    var copied = 0L
+                                    var r = inputStream.read(buf)
+                                    while (r >= 0) {
+                                        if (ctx.isCancelled) {
+                                            throw kotlinx.coroutines.CancellationException("Image export cancelled by user")
+                                        }
+                                        os.write(buf, 0, r)
+                                        copied += r
+                                        val p = 0.1f + (0.85f * (copied.toFloat() / totalBytes))
+                                        ctx.updateProgress(p.coerceIn(0.1f, 0.95f), "Writing MediaStore records...")
+                                        r = inputStream.read(buf)
+                                    }
+                                    os.flush()
+                                }
+                            } else {
+                                os.write(bytes)
+                            }
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            values.clear()
+                            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                            resolver.update(uri, values, null, null)
+                        }
+                        ctx.updateProgress(1.0f, "Completed")
+                        onPhotoSaved?.invoke(uri)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed writing image to MediaStore", e)
+                        try { resolver.delete(uri, null, null) } catch (_: Exception) {}
+                        throw e
+                    } finally {
+                        tempFile.delete()
                     }
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    values.clear()
-                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
-                }
-                val jobType = if (isNight) ProcessingJobType.MULTI_EXPOSURE_STACK else ProcessingJobType.SUPER_RES_SYNTHESIS
-                ProcessingJobQueue.instance.enqueueJob(
-                    title = if (isNight) "Night Burst HDR Fusion ($fileName)" else "Tone Curve & Grain Synthesis ($fileName)",
-                    type = jobType,
-                    outputPath = fileName,
-                    priority = JobPriority.NORMAL,
-                    executionBlock = { updateProgress ->
-                        updateProgress(0.5f, "Writing EXIF & MediaStore data")
-                        updateProgress(1.0f, "Completed")
-                    }
-                )
-                onPhotoSaved?.invoke(uri)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed writing image to MediaStore", e)
-                resolver.delete(uri, null, null)
-            } finally {
-                tempFile.delete()
-            }
+            )
         } else {
             tempFile.delete()
         }
@@ -1485,26 +1756,51 @@ class CommixRepository(private val context: Context) {
     fun savePanoramaImage(bytes: ByteArray, is360: Boolean, onSaved: ((Uri) -> Unit)? = null) {
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val prefix = if (is360) "COMMIX_360_" else "COMMIX_PANO_"
-        val fileName = "$prefix$timeStamp.jpg"
+        val ext = if (is360) ".jpg" else PhotoFormatEngine.getExtension(currentParams.photoFormat)
+        val mime = if (is360) "image/jpeg" else PhotoFormatEngine.getMimeType(currentParams.photoFormat)
+        val fileName = "$prefix$timeStamp$ext"
+
+        val finalBytes = if (!is360 && ext != ".jpg" && ext != ".jpeg") {
+            try {
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                if (bmp != null) {
+                    val bos = ByteArrayOutputStream()
+                    val effectiveQuality = if (PhotoFormatEngine.isLossless(currentParams.photoFormat, currentParams.photoQuality)) 100 else currentParams.photoQuality
+                    PhotoFormatEngine.encodeBitmap(bmp, currentParams.photoFormat, effectiveQuality, bos)
+                    bmp.recycle()
+                    bos.toByteArray()
+                } else {
+                    bytes
+                }
+            } catch (_: Throwable) {
+                bytes
+            }
+        } else {
+            bytes
+        }
 
         val tempFile = File(context.cacheDir, "temp_$fileName")
         try {
-            tempFile.writeBytes(bytes)
-            val orientation = activeCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-            val meta = ShotMetadata(
-                timestamp = System.currentTimeMillis(),
-                iso = currentParams.iso.takeIf { it > 0 },
-                exposureTimeNs = currentParams.expNs.takeIf { it > 0L },
-                activeMode = "PANORAMA"
-            )
-            ExifWriter.writeMetadata(tempFile, orientation, meta, exifOptions)
+            tempFile.writeBytes(finalBytes)
+            if (ext in listOf(".jpg", ".jpeg", ".heic", ".png", ".webp", ".dng")) {
+                val orientation = activeCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                val meta = ShotMetadata(
+                    timestamp = System.currentTimeMillis(),
+                    iso = currentParams.iso.takeIf { it > 0 },
+                    exposureTimeNs = currentParams.expNs.takeIf { it > 0L },
+                    activeMode = if (is360) "360" else "PANORAMA",
+                    compressionFormat = if (is360) "jpeg" else currentParams.photoFormat,
+                    compressionQuality = if (is360) 95 else if (PhotoFormatEngine.isLossless(currentParams.photoFormat, currentParams.photoQuality)) 100 else currentParams.photoQuality
+                )
+                ExifWriter.writeMetadata(tempFile, orientation, meta, exifOptions)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Failed embedding EXIF into panorama temp file: ${e.message}")
         }
 
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.MIME_TYPE, mime)
             put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Commix")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(MediaStore.Images.Media.IS_PENDING, 1)
@@ -1515,54 +1811,128 @@ class CommixRepository(private val context: Context) {
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
 
         if (uri != null) {
-            try {
-                resolver.openOutputStream(uri)?.use { os ->
-                    if (tempFile.exists()) {
-                        tempFile.inputStream().use { it.copyTo(os) }
-                    } else {
-                        os.write(bytes)
+            val jobTitle = if (is360) "360° Photo Sphere Stitching ($fileName)" else "Panorama Sweep Stitching ($fileName)"
+            val totalBytes = if (tempFile.exists()) tempFile.length().coerceAtLeast(1L) else finalBytes.size.toLong().coerceAtLeast(1L)
+
+            ProcessingJobQueue.instance.enqueueJobWithContext(
+                title = jobTitle,
+                type = ProcessingJobType.PANORAMA_STITCHING,
+                outputPath = fileName,
+                priority = JobPriority.HIGH,
+                executionBlock = { ctx ->
+                    try {
+                        ctx.updateProgress(0.1f, "Assembling panorama tiles...")
+                        resolver.openOutputStream(uri)?.use { os ->
+                            if (tempFile.exists()) {
+                                tempFile.inputStream().use { inputStream ->
+                                    val buf = ByteArray(32 * 1024)
+                                    var copied = 0L
+                                    var r = inputStream.read(buf)
+                                    while (r >= 0) {
+                                        if (ctx.isCancelled) {
+                                            throw kotlinx.coroutines.CancellationException("Panorama export cancelled by user")
+                                        }
+                                        os.write(buf, 0, r)
+                                        copied += r
+                                        val p = 0.1f + (0.85f * (copied.toFloat() / totalBytes))
+                                        ctx.updateProgress(p.coerceIn(0.1f, 0.95f), "Assembling panorama tiles...")
+                                        r = inputStream.read(buf)
+                                    }
+                                    os.flush()
+                                }
+                            } else {
+                                os.write(finalBytes)
+                            }
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            values.clear()
+                            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                            resolver.update(uri, values, null, null)
+                        }
+                        ctx.updateProgress(1.0f, "Completed")
+                        onPhotoSaved?.invoke(uri)
+                        onSaved?.invoke(uri)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed writing panorama image to MediaStore", e)
+                        try { resolver.delete(uri, null, null) } catch (_: Exception) {}
+                        throw e
+                    } finally {
+                        tempFile.delete()
                     }
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    values.clear()
-                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
-                }
-                ProcessingJobQueue.instance.enqueueJob(
-                    title = if (is360) "360° Photo Sphere Stitching ($fileName)" else "Panorama Sweep Stitching ($fileName)",
-                    type = ProcessingJobType.PANORAMA_STITCHING,
-                    outputPath = fileName,
-                    priority = JobPriority.HIGH,
-                    executionBlock = { updateProgress ->
-                        updateProgress(0.5f, "Assembling panorama tiles")
-                        updateProgress(1.0f, "Completed")
-                    }
-                )
-                onPhotoSaved?.invoke(uri)
-                onSaved?.invoke(uri)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed writing panorama image to MediaStore", e)
-                resolver.delete(uri, null, null)
-            } finally {
-                tempFile.delete()
-            }
+            )
         } else {
             tempFile.delete()
         }
     }
 
-    fun release() {
-        if (isRecordingVideo) {
-            stopVideoRecording()
+    /**
+     * Reconciles orphaned MediaStore rows left in IS_PENDING state by unexpected app termination,
+     * and clears abandoned temporary recording files from internal/external storage.
+     */
+    fun cleanupOrphanPendingRowsAndFiles() {
+        try {
+            val resolver = context.contentResolver
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // 1. Query orphaned pending videos
+                val videoUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                val projection = arrayOf(MediaStore.Video.Media._ID)
+                val selection = "${MediaStore.Video.Media.IS_PENDING} = 1 AND ${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?"
+                val selectionArgs = arrayOf("%Commix%")
+                resolver.query(videoUri, projection, selection, selectionArgs, null)?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(idCol)
+                        val deleteUri = ContentUris.withAppendedId(videoUri, id)
+                        try {
+                            resolver.delete(deleteUri, null, null)
+                            Log.i(TAG, "Cleaned up orphaned pending video row: $deleteUri")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed deleting orphan video row $deleteUri: ${e.message}")
+                        }
+                    }
+                }
+
+                // 2. Query orphaned pending photos
+                val imageUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                val imageProjection = arrayOf(MediaStore.Images.Media._ID)
+                val imageSelection = "${MediaStore.Images.Media.IS_PENDING} = 1 AND ${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
+                resolver.query(imageUri, imageProjection, imageSelection, selectionArgs, null)?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(idCol)
+                        val deleteUri = ContentUris.withAppendedId(imageUri, id)
+                        try {
+                            resolver.delete(deleteUri, null, null)
+                            Log.i(TAG, "Cleaned up orphaned pending image row: $deleteUri")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed deleting orphan image row $deleteUri: ${e.message}")
+                        }
+                    }
+                }
+            }
+
+            // 3. Clear abandoned temporary video/gcsv files from Movies/Commix that are not active
+            val videoDir = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Commix")
+            if (videoDir.exists() && videoDir.isDirectory) {
+                val activeFile = activeVideoFile
+                videoDir.listFiles()?.forEach { file ->
+                    if (file.isFile && file != activeFile && (System.currentTimeMillis() - file.lastModified() > 60_000L)) {
+                        try {
+                            file.delete()
+                            Log.i(TAG, "Pruned abandoned temp video file: ${file.name}")
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "cleanupOrphanPendingRowsAndFiles error: ${e.message}")
         }
-        sensorHub.stopOrientationUpdates()
-        thermalManager.stopMonitoring()
+    }
+
+    fun release() {
+        pauseCamera()
         audioEngine.release()
-        sessionManager.release()
-        analysisReader?.close()
-        analysisReader = null
-        stillReader?.close()
-        stillReader = null
         cameraThread?.quitSafely()
         cameraThread = null
         cameraHandler = null

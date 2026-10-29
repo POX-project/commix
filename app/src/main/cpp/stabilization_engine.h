@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <mutex>
 
 namespace commix {
 
@@ -38,6 +39,7 @@ public:
     // Start/Stop Gyroflow recording session
     void startLogging() noexcept;
     bool stopAndExportGyroflow(const char* outputPath, const char* cameraName, double frameRate) noexcept;
+    bool isLogging() const noexcept { return m_isLogging.load(std::memory_order_acquire); }
 
     // Real-Time Kalman Filter for Virtual Gimbal
     void updateKalman(float pitch, float roll, float yaw, float dt, float& outPitch, float& outRoll, float& outYaw) noexcept;
@@ -56,6 +58,7 @@ private:
     std::atomic<size_t> m_writeIndex;
     std::atomic<bool> m_isLogging;
     size_t m_logStartIndex;
+    std::mutex m_bufferMutex;
 
     // Kalman state
     float m_kalmanPitch;

@@ -87,7 +87,8 @@ object MagneticFpsSnapper {
 data class VideoQualityProfile(
     val label: String,
     val bitrateBps: Int,
-    val description: String
+    val description: String,
+    val isAllI: Boolean = false
 ) {
     val title: String get() = label
     val megaBytesPerMinute: Double get() = estimateMbPerMinute(bitrateBps)
@@ -96,11 +97,11 @@ data class VideoQualityProfile(
 
     companion object {
         val profiles = listOf(
-            VideoQualityProfile("Broadcast Eco", 25_000_000, "25 Mbps · Web & Social"),
-            VideoQualityProfile("High Quality", 50_000_000, "50 Mbps · Documentary & YouTube 4K"),
-            VideoQualityProfile("Pro Cinema", 100_000_000, "100 Mbps · Color Grading & Film"),
-            VideoQualityProfile("Master Broadcast", 150_000_000, "150 Mbps · Studio Broadcast Quality"),
-            VideoQualityProfile("Cinema Master", 200_000_000, "200 Mbps · Ultra-High Bitrate All-I")
+            VideoQualityProfile("Broadcast Eco", 25_000_000, "25 Mbps · Web & Social", isAllI = false),
+            VideoQualityProfile("High Quality", 50_000_000, "50 Mbps · Documentary & YouTube 4K", isAllI = false),
+            VideoQualityProfile("Pro Cinema", 100_000_000, "100 Mbps · Color Grading & Film", isAllI = false),
+            VideoQualityProfile("Master Broadcast", 150_000_000, "150 Mbps · Studio Broadcast Quality", isAllI = false),
+            VideoQualityProfile("Cinema Master", 200_000_000, "200 Mbps · Ultra-High Bitrate All-I", isAllI = true)
         )
 
         fun estimateMbPerMinute(bitrateBps: Int): Double {
@@ -159,6 +160,7 @@ object PipelineThroughputEngine {
         }
         val upper = resolution.uppercase()
         return when {
+            upper.contains("7680") || upper.contains("8K") -> Pair(7680, 4320)
             upper.contains("3840") || upper.contains("4K") -> Pair(3840, 2160)
             upper.contains("1920") || upper.contains("1080") -> Pair(1920, 1080)
             upper.contains("1280") || upper.contains("720") -> Pair(1280, 720)
@@ -209,7 +211,9 @@ object PipelineThroughputEngine {
             }
             val overloadPct = (overloadRatio * 100.0).coerceIn(100.0, 300.0)
             val desc = if (exceedsHardwareRate) {
-                if (recPixels >= 30_000_000) {
+                if (recPixels >= 33_000_000) {
+                    "Ultra-high resolution sensor limit: 8K / ${w}x${h} readout is capped at ${effectiveHardwareMax} FPS."
+                } else if (recPixels >= 30_000_000) {
                     "Ultra-high resolution sensor limit: ${w}x${h} readout is capped at ${effectiveHardwareMax} FPS."
                 } else if (recPixels >= 3840.0 * 2160.0) {
                     "Hardware video encoder ceiling: 4K UHD is physically limited to ${effectiveHardwareMax.toInt()} FPS."
@@ -359,6 +363,7 @@ object PipelineThroughputEngine {
         val targetPixels = (mp * 1_000_000.0).coerceAtLeast(300_000.0)
         when {
             mp in 63.5..64.5 -> return Pair(9248, 6936)
+            mp in 32.5..34.5 -> return Pair(7680, 4320)
             mp in 15.5..16.5 -> return Pair(4624, 3472)
             mp in 11.5..12.5 -> return Pair(4624, 2600)
             mp in 8.1..8.5 -> return Pair(3840, 2160)
@@ -380,6 +385,7 @@ object PipelineThroughputEngine {
         val mp = (w.toLong() * h.toLong()) / 1_000_000.0
         val isStandard = when {
             (w == 9248 && h == 6936) || mp >= 63.5 -> true // 64MP Samsung GW1 full sensor mode
+            (w == 7680 && h == 4320) || (w == 8192 && h == 4320) -> true // 8K UHD / 8K DCI
             (w == 4624 && h == 3472) || (mp in 15.5..16.5 && kotlin.math.abs((w.toDouble() / h.toDouble()) - (4.0 / 3.0)) < 0.05) -> true // 16MP 4:3 native bin
             (w == 4624 && h == 2600) || (mp in 11.5..12.5 && kotlin.math.abs((w.toDouble() / h.toDouble()) - (16.0 / 9.0)) < 0.05) -> true // 12MP 16:9 crop
             w == 4096 && h == 2160 -> true
@@ -393,6 +399,8 @@ object PipelineThroughputEngine {
         val name = when {
             (w == 9248 && h == 6936) || mp >= 63.5 -> String.format(java.util.Locale.US, "%.0fMP FULL SENSOR", mp)
             mp >= 60.0 -> String.format(java.util.Locale.US, "%.0fMP FULL SENSOR", mp)
+            w == 8192 && h == 4320 -> "8K DCI CINEMA (17:9)"
+            w == 7680 && h == 4320 -> "8K UHD BROADCAST (16:9)"
             (w == 4624 && h == 3472) || (mp in 15.5..16.5 && kotlin.math.abs((w.toDouble() / h.toDouble()) - (4.0 / 3.0)) < 0.05) -> "16MP 4:3 SENSOR BIN"
             (w == 4624 && h == 2600) || (mp in 11.5..12.5 && kotlin.math.abs((w.toDouble() / h.toDouble()) - (16.0 / 9.0)) < 0.05) -> "12MP 16:9 SENSOR CROP"
             w == 4096 && h == 2160 -> "4K DCI CINEMA (17:9)"
@@ -454,4 +462,3 @@ object PipelineThroughputEngine {
         return deduplicated
     }
 }
-

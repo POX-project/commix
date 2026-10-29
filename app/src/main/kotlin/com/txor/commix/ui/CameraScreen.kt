@@ -20,8 +20,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
@@ -34,6 +36,7 @@ import android.provider.MediaStore
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import java.util.Locale
+import com.txor.commix.PhotoFormatEngine
 import com.txor.commix.ProcessingJobQueue
 import com.txor.commix.ui.components.*
 import com.txor.commix.ui.modals.CinemaSlateSheet
@@ -124,13 +127,13 @@ fun CameraScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(top = 12.dp)
-                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .padding(horizontal = 12.dp, vertical = 4.dp)
+                .zIndex(20f)
         ) {
             // Left Group: Flash Toggle & Action Mode / Shield Indicator
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 // Flash Circle Button
                 Box(
@@ -203,66 +206,28 @@ fun CameraScreen(
                 }
             }
 
-            // Center Group: Apple Expandable Chevron & Status Pill
-            if (isVideoMode) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.KeyboardArrowDown,
-                        contentDescription = "Expand",
-                        tint = Color.White.copy(alpha = 0.7f),
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(Color(0x99000000))
-                            .border(0.8.dp, Color(0x33FFFFFF), RoundedCornerShape(14.dp))
-                            .padding(horizontal = 10.dp, vertical = 3.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = null,
-                                tint = CinemaGreen,
-                                modifier = Modifier.size(12.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Mode: ${state.activeMode}",
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 11.sp
-                            )
-                        }
-                    }
-                }
-            } else {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .width(44.dp)
-                        .height(32.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Color(0x22000000))
-                        .clickable { viewModel.toggleProControls() }
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.KeyboardArrowDown,
-                        contentDescription = "Expand",
-                        tint = Color.White,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
+            // Center Group: Apple Expandable Chevron for Pro Controls
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .width(44.dp)
+                    .height(32.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(if (state.showProControls) Color(0x33FFFFFF) else Color(0x22000000))
+                    .clickable { viewModel.toggleProControls() }
+            ) {
+                Icon(
+                    imageVector = if (state.showProControls) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = "Expand Pro Controls",
+                    tint = if (state.showProControls) AppleYellow else Color.White,
+                    modifier = Modifier.size(18.dp)
+                )
             }
 
             // Right Group: Video Format / RAW & MP Badges / Settings Sliders
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 if (isVideoMode) {
                     // Video Resolution & FPS Pill (e.g. 64MP · 2 or 1080p · 24)
@@ -312,28 +277,37 @@ fun CameraScreen(
                         )
                     }
                 } else {
-                    // RAW Toggle Badge
-                    val isRawActive = state.photoFormat.contains("raw")
+                    // Format & Lossless Toggle Badge (JPEG, HEIC, PNG, WEBP, UNCOMP/BMP, TIFF, RAW)
+                    val isLosslessActive = PhotoFormatEngine.isLossless(state.photoFormat, state.photoQuality)
+                    val formatBadgeLabel = when (state.photoFormat.lowercase()) {
+                        PhotoFormatEngine.FORMAT_RAW_DNG, "dng", "raw" -> "RAW"
+                        PhotoFormatEngine.FORMAT_LOSSLESS, "bmp" -> "UNCOMP"
+                        PhotoFormatEngine.FORMAT_TIFF, "tif" -> "TIFF"
+                        PhotoFormatEngine.FORMAT_HEIC, "heif" -> "HEIC"
+                        PhotoFormatEngine.FORMAT_PNG -> "PNG"
+                        PhotoFormatEngine.FORMAT_WEBP -> if (state.photoQuality >= 100) "WEBP-L" else "WEBP"
+                        else -> if (state.photoQuality >= 100) "JPEG-MAX" else "JPEG"
+                    }
                     Box(
                         contentAlignment = Alignment.Center,
                         modifier = Modifier
                             .height(28.dp)
                             .clip(RoundedCornerShape(14.dp))
-                            .background(if (isRawActive) AppleYellow else Color(0x33000000))
+                            .background(if (isLosslessActive) AppleYellow else Color(0x33000000))
                             .border(
                                 0.8.dp,
-                                if (isRawActive) AppleYellow else Color(0x33FFFFFF),
+                                if (isLosslessActive) AppleYellow else Color(0x33FFFFFF),
                                 RoundedCornerShape(14.dp)
                             )
                             .clickable {
                                 CommixHaptics.click(context, state.hapticsEnabled)
-                                viewModel.onToggleRaw()
+                                viewModel.onCyclePhotoFormat()
                             }
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     ) {
                         Text(
-                            text = "RAW",
-                            color = if (isRawActive) Color.Black else Color.White,
+                            text = formatBadgeLabel,
+                            color = if (isLosslessActive) Color.Black else Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 10.5.sp,
                             letterSpacing = 0.3.sp
@@ -412,7 +386,8 @@ fun CameraScreen(
         BoxWithConstraints(
             modifier = Modifier
                 .weight(1f)
-                .fillMaxWidth(),
+                .fillMaxWidth()
+                .clipToBounds(),
             contentAlignment = Alignment.Center
         ) {
             val isVideoOrCinema = state.activeMode in listOf("VIDEO", "SLOW-MO", "TIME-LAPSE", "CINEMATIC", "AUTOMATION")
@@ -420,15 +395,20 @@ fun CameraScreen(
                 if (isVideoOrCinema) 9f / 16f else 3f / 4f
             }
 
+            val is43 = kotlin.math.abs(targetRatio - 0.75f) < 0.05f
+            val vfCornerRadius = if (is43) 24.dp else 0.dp
+
             val containerRatio = maxWidth / maxHeight
             val vfModifier = if (containerRatio > targetRatio) {
-                Modifier.fillMaxHeight().aspectRatio(targetRatio)
+                Modifier.fillMaxHeight().aspectRatio(targetRatio, matchHeightConstraintsFirst = true)
             } else {
-                Modifier.fillMaxWidth().aspectRatio(targetRatio)
+                Modifier.fillMaxWidth().aspectRatio(targetRatio, matchHeightConstraintsFirst = false)
             }
 
             Box(
                 modifier = vfModifier
+                    .clip(RoundedCornerShape(vfCornerRadius))
+                    .clipToBounds()
                     .background(Color.Black)
                     .onGloballyPositioned { coords ->
                         vfWidth = coords.size.width.toFloat().coerceAtLeast(1f)
@@ -466,8 +446,8 @@ fun CameraScreen(
                 val previewW = state.previewWidth
                 val previewH = state.previewHeight
                 ViewfinderSurface(
-                    onSurfaceReady = { surface ->
-                        viewModel.onSurfaceAvailable(surface)
+                    onSurfaceReady = { surface, surfaceTexture ->
+                        viewModel.onSurfaceAvailable(surface, surfaceTexture)
                     },
                     onSurfaceDestroyed = {
                         viewModel.onSurfaceDestroyed()
@@ -484,6 +464,7 @@ fun CameraScreen(
                         } else 1f
                         scaleX = digScale
                         scaleY = digScale
+                        clip = true
                     }
                 )
 
@@ -824,16 +805,19 @@ fun CameraScreen(
                     }
                 }
 
-                // Scopes, Rule-of-Thirds Grid, and Center Reticle
+                // Scopes, Rule-of-Thirds Grid, Center Reticle, and Vectorscope
                 ScopesOverlay(
                     showWaveform = state.showWaveform,
                     showHistogram = state.showHistogram,
                     showHorizon = state.showHorizonLeveler,
                     showGrid = state.showGrid,
+                    showVectorscope = state.showVectorscope || state.showScopes,
                     rollDeg = state.rollDeg,
                     pitchDeg = state.pitchDeg,
                     waveformCols = state.waveformCols,
-                    lumaHistogram = state.lumaHistogram
+                    lumaHistogram = state.lumaHistogram,
+                    vectorscopeSamples = state.vectorscopeSamples,
+                    vectorscopeCount = state.vectorscopeCount
                 )
 
                 // Samsung One UI Composition & Horizon Suggestion
@@ -1169,6 +1153,7 @@ fun CameraScreen(
                 .fillMaxWidth()
                 .background(CinemaBlack)
                 .padding(bottom = 36.dp + navBottom, top = 4.dp)
+                .zIndex(20f)
         ) {
             // Pro Controls Expandable Drawer
             AnimatedVisibility(visible = state.showProControls) {
@@ -1222,6 +1207,8 @@ fun CameraScreen(
                     onToggleHistogram = { viewModel.toggleHistogram() },
                     showWaveform = state.showWaveform,
                     onToggleWaveform = { viewModel.toggleWaveform() },
+                    showVectorscope = state.showVectorscope,
+                    onToggleVectorscope = { viewModel.toggleVectorscope() },
                     showHorizon = state.showHorizonLeveler,
                     onToggleHorizon = { viewModel.toggleHorizon() },
                     showGrid = state.showGrid,

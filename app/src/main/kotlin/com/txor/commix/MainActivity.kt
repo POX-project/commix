@@ -47,6 +47,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        viewModel.onAppForeground()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        viewModel.onAppBackground()
+    }
+
     private fun requestRequiredPermissions() {
         val permissions = mutableListOf(
             Manifest.permission.CAMERA,

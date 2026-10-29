@@ -11,46 +11,56 @@ float ColorScienceEngine::linearToLog(float x, TransferCurveType curve) noexcept
             return (x < 0.018f) ? (4.5f * x) : (1.099f * std::pow(x, 0.45f) - 0.099f);
 
         case TransferCurveType::ArriLogC3: {
-            constexpr float a = 400.0f;
-            constexpr float b = 0.040761f;
+            constexpr float a = 5.555556f;
+            constexpr float b = 0.052272f;
             constexpr float c = 0.247190f;
             constexpr float d = 0.385537f;
             constexpr float cut = 0.010591f;
+            constexpr float e = 5.367655f;
+            constexpr float f = 0.092809f;
             if (x > cut) {
                 return c * std::log10(a * x + b) + d;
             }
-            constexpr float e = 23.364491f;
-            constexpr float f = 0.042835f;
             return e * x + f;
         }
 
         case TransferCurveType::ArriLogC4: {
-            constexpr float a = 222.86f;
-            constexpr float b = 0.0018f;
-            constexpr float c = 0.07f;
-            return (std::log2(a * x + 1.0f) * c) + b;
+            constexpr float a = 2231.826309f;
+            constexpr float b = 0.907135875f;
+            constexpr float c = 0.092864125f;
+            constexpr float s = 0.113597209f;
+            constexpr float t = -0.018056996f;
+            if (x >= t) {
+                return (std::log2(a * x + 64.0f) - 6.0f) / 14.0f * b + c;
+            }
+            return (x - t) / s;
         }
 
         case TransferCurveType::SonySLog3: {
             if (x >= 0.01125f) {
                 return (420.0f + std::log10((x + 0.01f) / (0.18f + 0.01f)) * 261.5f) / 1023.0f;
             }
-            return (x * (171.2102946929f / 0.01125f) + 95.0f) / 1023.0f;
+            return (x * ((171.2102946929f - 95.0f) / 0.01125f) + 95.0f) / 1023.0f;
         }
 
         case TransferCurveType::CanonCLog2: {
-            if (x >= 0.00392f) {
-                return 0.281863f * std::log10(87.257f * x + 1.0f) + 0.035388f;
+            const float xr = x / 0.9f;
+            if (xr < 0.0f) {
+                return -(0.281863093f * std::log10(-xr * 87.09937546f + 1.0f) - 0.035388128f);
             }
-            return 6.1396f * x + 0.035388f;
+            return 0.281863093f * std::log10(xr * 87.09937546f + 1.0f) + 0.035388128f;
         }
 
         case TransferCurveType::RedLog3G10: {
             constexpr float a = 0.224282f;
             constexpr float b = 155.975327f;
             constexpr float c = 0.01f;
-            constexpr float g = 0.5f;
-            return a * std::log10((x + c) * b + 1.0f) + g;
+            constexpr float g = 15.1927f;
+            const float xr = x + c;
+            if (xr < 0.0f) {
+                return xr * g;
+            }
+            return a * std::log10(xr * b + 1.0f);
         }
 
         case TransferCurveType::AppleLog: {
@@ -92,24 +102,24 @@ float ColorScienceEngine::logToLinear(float y, TransferCurveType curve) noexcept
             return (y < 0.081f) ? (y / 4.5f) : std::pow((y + 0.099f) / 1.099f, 1.0f / 0.45f);
 
         case TransferCurveType::ArriLogC3: {
-            constexpr float a = 400.0f;
-            constexpr float b = 0.040761f;
+            constexpr float a = 5.555556f;
+            constexpr float b = 0.052272f;
             constexpr float c = 0.247190f;
             constexpr float d = 0.385537f;
-            constexpr float cut = 0.149658f;
-            if (y > cut) {
+            constexpr float e = 5.367655f;
+            constexpr float f = 0.092809f;
+            constexpr float cutEncoded = 0.149657834f;
+            if (y > cutEncoded) {
                 return (std::pow(10.0f, (y - d) / c) - b) / a;
             }
-            constexpr float e = 23.364491f;
-            constexpr float f = 0.042835f;
             return (y - f) / e;
         }
 
         case TransferCurveType::SonySLog3: {
-            if (y >= 95.0f / 1023.0f) {
+            if (y >= 171.2102946929f / 1023.0f) {
                 return std::pow(10.0f, ((y * 1023.0f - 420.0f) / 261.5f)) * (0.18f + 0.01f) - 0.01f;
             }
-            return (y * 1023.0f - 95.0f) * (0.01125f / 171.2102946929f);
+            return (y * 1023.0f - 95.0f) * (0.01125f / (171.2102946929f - 95.0f));
         }
 
         case TransferCurveType::AppleLog: {
@@ -119,33 +129,37 @@ float ColorScienceEngine::logToLinear(float y, TransferCurveType curve) noexcept
         }
 
         case TransferCurveType::ArriLogC4: {
-            constexpr float a = (262144.0f - 16.0f) / 117.45f;
-            constexpr float b = (1023.0f * 0.18f - 16.0f) / 117.45f;
-            constexpr float c = 117.45f / 1023.0f;
-            constexpr float s = (16384.0f * 64.0f - 64.0f) / 1023.0f;
-            constexpr float t = 64.0f / 1023.0f;
-            if (y >= t) {
-                return (std::pow(2.0f, (y - c) * 14.0f) - b) / a;
+            constexpr float a = 2231.826309f;
+            constexpr float b = 0.907135875f;
+            constexpr float c = 0.092864125f;
+            constexpr float s = 0.113597209f;
+            constexpr float t = -0.018056996f;
+            if (y >= 0.0f) {
+                const float p = 14.0f * (y - c) / b + 6.0f;
+                return (std::pow(2.0f, p) - 64.0f) / a;
             }
-            return (y - t) / s;
+            return y * s + t;
         }
 
         case TransferCurveType::CanonCLog2: {
-            if (y > 0.086307f) {
-                return (std::pow(10.0f, (y - 0.252033f) / 0.281863f) - 0.035388f) * 0.9f;
+            constexpr float a = 0.281863093f;
+            constexpr float b = 87.09937546f;
+            constexpr float c = 0.035388128f;
+            if (y < c) {
+                return (-(std::pow(10.0f, (c - y) / a) - 1.0f) / b) * 0.9f;
             }
-            return (y - 0.078604f) / 0.088649f * 0.9f;
+            return (std::pow(10.0f, (y - c) / a) - 1.0f) / b * 0.9f;
         }
 
         case TransferCurveType::RedLog3G10: {
             constexpr float a = 0.224282f;
             constexpr float b = 155.975327f;
             constexpr float c = 0.01f;
-            constexpr float g = 3.574423f;
-            if (y >= 0.0f) {
-                return (std::pow(10.0f, y / a) - 1.0f) / b;
+            constexpr float g = 15.1927f;
+            if (y < 0.0f) {
+                return (y / g) - c;
             }
-            return (y * g) - c;
+            return (std::pow(10.0f, y / a) - 1.0f) / b - c;
         }
 
         case TransferCurveType::Hlg: {

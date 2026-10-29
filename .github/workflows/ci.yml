@@ -1,0 +1,222 @@
+name: Commix CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verification:
+    name: C++20 Native Engine & Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Verify Host C++20 Compiler
+        run: |
+          g++ --version
+          g++ -std=c++20 -dM -E -x c++ /dev/null | grep -F __cplusplus
+
+      - name: Make Gradle executable
+        run: chmod +x ./gradlew
+
+      - name: Run C++20 Native Engine & JNI Tests
+        run: ./gradlew --no-daemon --stacktrace :app:testNative
+
+      - name: Run JVM Unit Tests (Debug & Release)
+        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:testReleaseUnitTest
+
+      - name: Upload Test Reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: warn
+          retention-days: 14
+
+  build:
+    name: Assemble Debug & Release APKs
+    needs: verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      version_tag: ${{ steps.version.outputs.version_tag }}
+      apk_name: ${{ steps.version.outputs.apk_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android NDK & CMake
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          link-to-sdk: true
+
+      - name: Make Gradle executable
+        run: chmod +x ./gradlew
+
+      - name: Extract Version Info
+        id: version
+        run: |
+          VERSION_NAME=$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle.kts | head -n 1)
+          test -n "$VERSION_NAME" || VERSION_NAME="1.0.0"
+          VERSION_TAG="v$VERSION_NAME"
+          APK_NAME="commix-$VERSION_TAG-release.apk"
+
+          echo "VERSION_TAG=$VERSION_TAG" >> "$GITHUB_ENV"
+          echo "APK_NAME=$APK_NAME" >> "$GITHUB_ENV"
+          echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Release Signing (Optional Secret)
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$SIGNING_KEYSTORE_BASE64" ] && [ -n "$SIGNING_KEYSTORE_PASSWORD" ]; then
+            KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+            printf '%s' "$SIGNING_KEYSTORE_BASE64" | tr -d '\r\n[:space:]' | base64 --decode > "$KEYSTORE_FILE"
+            echo "SIGNING_STORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "SIGNING_STORE_PASSWORD=$SIGNING_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            if [ -n "$SIGNING_KEY_ALIAS" ]; then
+              echo "SIGNING_KEY_ALIAS=$SIGNING_KEY_ALIAS" >> "$GITHUB_ENV"
+            fi
+            if [ -n "$SIGNING_KEY_PASSWORD" ]; then
+              echo "SIGNING_KEY_PASSWORD=$SIGNING_KEY_PASSWORD" >> "$GITHUB_ENV"
+            fi
+            echo "Release keystore configured from repository secrets."
+          else
+            echo "No custom release keystore secret provided; falling back to debug signature."
+          fi
+
+      - name: Build Debug & Release APKs
+        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug :app:assembleRelease
+
+      - name: Package & Verify APKs
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/commix-debug.apk
+          cp app/build/outputs/apk/release/app-release.apk "dist/$APK_NAME"
+
+          APKSIGNER="$ANDROID_HOME/build-tools/$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs "dist/$APK_NAME"
+
+          cd dist
+          sha256sum commix-debug.apk "$APK_NAME" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: commix-release-apk
+          path: dist/commix-v*-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: commix-debug-apk
+          path: dist/commix-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Release APK
+        uses: actions/download-artifact@v4
+        with:
+          name: commix-release-apk
+          path: release_assets/
+
+      - name: Download Checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: release_assets/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          APK_NAME: ${{ needs.build.outputs.apk_name }}
+        run: |
+          cat << 'EOF' > release_notes.md
+          ### ⚡ Commix Pro Cinema Camera Release
+
+          Official release built from commit `${{ github.sha }}`.
+
+          #### Highlights
+          - **C++20 Aether Engine**: Real-time vectorscope, RGB parade, waveform, log color-science pipeline, and Bayer demosaic.
+          - **Full Camera2 HAL3 Access**: Manual ISO, Shutter Speed, Focus Distance, RAW capture, and Cinema Matte letterboxing.
+          - **High-Speed Hardware Encoding**: 4K/8K recording with frame pacing and Gyroflow v1.3 IMU motion stabilization sidecars.
+          - **Zero-Jank Compose HUD**: Studio-grade ergonomics and physical tactile dials.
+
+          #### Verification
+          - Native C++20 engine verification suite: 100% passed.
+          - JNI boundary suite: 100% passed.
+          - Kotlin test suites: 100% passed across Debug and Release variants.
+
+          #### Checksums
+          Refer to `SHA256SUMS.txt` attached below to verify artifact integrity.
+          EOF
+
+          gh release create "$TAG" \
+            release_assets/* \
+            --title "Commix $TAG" \
+            --notes-file release_notes.md

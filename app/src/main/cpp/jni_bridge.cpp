@@ -32,6 +32,22 @@ static inline bool validateDirectBuffer(JNIEnv* env, jobject buf, size_t require
     return cap >= 0 && static_cast<size_t>(cap) >= requiredBytes;
 }
 
+// A direct buffer address must not be read past the byte count the caller
+// claims, and the claim itself must not be computed by arithmetic that can
+// wrap. Returns 0 (a size no real buffer satisfies) when the geometry is
+// unusable, so callers can treat 0 as "reject".
+static inline size_t checkedImageBytes(jint width, jint height, jint channels) {
+    if (width <= 0 || height <= 0 || channels <= 0) return 0;
+    const size_t w = static_cast<size_t>(width);
+    const size_t h = static_cast<size_t>(height);
+    const size_t c = static_cast<size_t>(channels);
+    constexpr size_t kMaxBytes = static_cast<size_t>(1) << 40;  // 1 TiB; no camera frame is near this
+    if (w > kMaxBytes / h) return 0;
+    const size_t pixels = w * h;
+    if (pixels > kMaxBytes / c) return 0;
+    return pixels * c;
+}
+
 // ============================================================================
 // NativeTelemetryBridge Methods
 // ============================================================================
@@ -63,10 +79,20 @@ static void JNICALL native_compute_scopes_direct(
     jobject y_buf, jobject u_buf, jobject v_buf,
     jint width, jint height, jint y_stride, jint uv_stride, jint uv_pixel_stride, jint step
 ) {
-    if (!y_buf || !u_buf || !v_buf || width < 2 || height < 2 || y_stride < width || uv_stride < (width / 2) || uv_pixel_stride < 1) return;
+    if (!y_buf || !u_buf || !v_buf || width < 2 || height < 2 || uv_pixel_stride < 1) return;
 
-    size_t reqY = static_cast<size_t>(height - 1) * y_stride + width;
-    size_t reqUV = static_cast<size_t>((height / 2) - 1) * uv_stride + ((width / 2) - 1) * uv_pixel_stride + 1;
+    // The required byte counts come from scopes_engine.h, the same helpers
+    // compute_scopes() uses for its own row/column clamping. The previous inline
+    // formula ((height/2 - 1) * uv_stride + (width/2 - 1) * uv_pixel_stride + 1)
+    // under-counted by one chroma row and column on odd frame sizes, so it
+    // accepted buffers the reader then walked off the end of.
+    //
+    // Both helpers return 0 for geometry they consider unusable; width and height
+    // are already >= 2 here, so 0 always means a stride too small for the
+    // claimed frame size and must be rejected.
+    const size_t reqY = commix::luma_plane_bytes(width, height, y_stride);
+    const size_t reqUV = commix::chroma_plane_bytes(width, height, uv_stride, uv_pixel_stride);
+    if (reqY == 0 || reqUV == 0) return;
 
     if (!validateDirectBuffer(env, y_buf, reqY) ||
         !validateDirectBuffer(env, u_buf, reqUV) ||
@@ -135,7 +161,8 @@ static void JNICALL native_compute_scopes_direct(
 
 static jboolean JNICALL native_read_telemetry(
     JNIEnv* env, jclass /*clazz*/,
-    jfloatArray outFloats, jintArray outLumaBins, jfloatArray outWaveCols
+    jfloatArray outFloats, jintArray outLumaBins, jfloatArray outWaveCols,
+    jfloatArray outVscope
 ) {
     auto* tb = commix_get_telemetry_buffer();
     if (!tb) return JNI_FALSE;
@@ -145,11 +172,13 @@ static jboolean JNICALL native_read_telemetry(
     if ((b1 & 1u) || (b1 != e1)) return JNI_FALSE; // Writer active
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
-    // Snapshot fields to local stack memory
-    jfloat f[10] = {
+    // Snapshot fields to local stack memory (including lens AF distance and state)
+    jfloat f[13] = {
         tb->audio_norm, tb->audio_db, tb->audio_left_db, tb->audio_right_db,
         tb->gyro_pitch, tb->gyro_roll, tb->gyro_yaw,
-        tb->spot_ire, tb->hi_clip_pct, tb->lo_clip_pct
+        tb->spot_ire, tb->hi_clip_pct, tb->lo_clip_pct,
+        static_cast<jfloat>(tb->vscope_count),
+        tb->af_distance, static_cast<jfloat>(tb->af_state)
     };
     int32_t lumaSnapshot[COMMIX_HIST_BINS];
     if (outLumaBins) {
@@ -159,6 +188,10 @@ static jboolean JNICALL native_read_telemetry(
     if (outWaveCols) {
         std::memcpy(waveSnapshot, tb->wave_cols_avg, sizeof(waveSnapshot));
     }
+    float vscopeSnapshot[COMMIX_VSCOPE_MAX_SAMPLES * 2];
+    if (outVscope) {
+        std::memcpy(vscopeSnapshot, tb->vscope_samples, sizeof(vscopeSnapshot));
+    }
 
     std::atomic_thread_fence(std::memory_order_seq_cst);
     uint32_t b2 = tb->seq_begin.load(std::memory_order_acquire);
@@ -166,8 +199,15 @@ static jboolean JNICALL native_read_telemetry(
     if (b1 != b2 || b1 != e2) return JNI_FALSE; // Frame torn during read (writer started or finished during snapshot)
 
     // Safely commit local snapshot to JVM arrays
-    if (outFloats && env->GetArrayLength(outFloats) >= 10) {
-        env->SetFloatArrayRegion(outFloats, 0, 10, f);
+    if (outFloats) {
+        jsize len = env->GetArrayLength(outFloats);
+        if (len >= 13) {
+            env->SetFloatArrayRegion(outFloats, 0, 13, f);
+        } else if (len >= 11) {
+            env->SetFloatArrayRegion(outFloats, 0, 11, f);
+        } else if (len >= 10) {
+            env->SetFloatArrayRegion(outFloats, 0, 10, f);
+        }
     }
 
     if (outLumaBins && env->GetArrayLength(outLumaBins) >= COMMIX_HIST_BINS) {
@@ -176,6 +216,10 @@ static jboolean JNICALL native_read_telemetry(
 
     if (outWaveCols && env->GetArrayLength(outWaveCols) >= COMMIX_WAVE_COLS) {
         env->SetFloatArrayRegion(outWaveCols, 0, COMMIX_WAVE_COLS, waveSnapshot);
+    }
+
+    if (outVscope && env->GetArrayLength(outVscope) >= COMMIX_VSCOPE_MAX_SAMPLES * 2) {
+        env->SetFloatArrayRegion(outVscope, 0, COMMIX_VSCOPE_MAX_SAMPLES * 2, vscopeSnapshot);
     }
 
     return JNI_TRUE;
@@ -196,7 +240,8 @@ static jboolean JNICALL native_process_zero_direct(
     jint curvePreset, jint grainPreset, jfloat grainIntensity
 ) {
     if (!buffer || width <= 0 || height <= 0 || channels <= 0) return JNI_FALSE;
-    size_t required = static_cast<size_t>(width) * height * channels;
+    size_t required = checkedImageBytes(width, height, channels);
+    if (required == 0) return JNI_FALSE;
     if (!validateDirectBuffer(env, buffer, required)) return JNI_FALSE;
 
     uint8_t* ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(buffer));
@@ -215,7 +260,8 @@ static void JNICALL native_apply_unsharp_mask_direct(
     jfloat amount, jfloat radius
 ) {
     if (!buffer || width <= 0 || height <= 0 || channels <= 0) return;
-    size_t required = static_cast<size_t>(width) * height * channels;
+    size_t required = checkedImageBytes(width, height, channels);
+    if (required == 0) return;
     if (!validateDirectBuffer(env, buffer, required)) return;
 
     uint8_t* ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(buffer));
@@ -233,7 +279,8 @@ static void JNICALL native_apply_cdl_direct(
     jfloat saturation
 ) {
     if (!buffer || width <= 0 || height <= 0 || channels <= 0) return;
-    size_t required = static_cast<size_t>(width) * height * channels;
+    size_t required = checkedImageBytes(width, height, channels);
+    if (required == 0) return;
     if (!validateDirectBuffer(env, buffer, required)) return;
 
     uint8_t* ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(buffer));
@@ -252,18 +299,47 @@ static void JNICALL native_start_imu_logging(JNIEnv* /*env*/, jclass /*clazz*/) 
     commix::StabilizationEngine::instance().startLogging();
 }
 
+static void JNICALL native_push_imu_sample(
+    JNIEnv* /*env*/, jclass /*clazz*/,
+    jlong timestampNs,
+    jfloat gx, jfloat gy, jfloat gz,
+    jfloat ax, jfloat ay, jfloat az
+) {
+    commix::StabilizationEngine::instance().pushImuSample(
+        static_cast<int64_t>(timestampNs),
+        gx, gy, gz,
+        ax, ay, az
+    );
+}
+
 static jboolean JNICALL native_stop_and_export_gyroflow(
     JNIEnv* env, jclass /*clazz*/,
     jstring outputPath, jstring cameraName, jdouble frameRate
 ) {
     if (!outputPath) return JNI_FALSE;
+
+    // GetStringUTFChars returns NULL when the VM cannot allocate the UTF-8 copy,
+    // with OutOfMemoryError already pending. A NULL result must never be
+    // dereferenced, passed to the exporter, or handed to ReleaseStringUTFChars;
+    // the pending exception is left alone so it propagates to Java.
     const char* pathStr = env->GetStringUTFChars(outputPath, nullptr);
-    const char* camStr = cameraName ? env->GetStringUTFChars(cameraName, nullptr) : "";
+    if (!pathStr) return JNI_FALSE;
 
-    bool success = commix::StabilizationEngine::instance().stopAndExportGyroflow(pathStr, camStr, frameRate);
+    const char* camStr = nullptr;
+    if (cameraName) {
+        camStr = env->GetStringUTFChars(cameraName, nullptr);
+        if (!camStr) {
+            env->ReleaseStringUTFChars(outputPath, pathStr);
+            return JNI_FALSE;
+        }
+    }
 
-    env->ReleaseStringUTFChars(outputPath, pathStr);
+    bool success = commix::StabilizationEngine::instance().stopAndExportGyroflow(
+        pathStr, camStr, frameRate
+    );
+
     if (cameraName) env->ReleaseStringUTFChars(cameraName, camStr);
+    env->ReleaseStringUTFChars(outputPath, pathStr);
 
     return success ? JNI_TRUE : JNI_FALSE;
 }
@@ -309,13 +385,37 @@ static jboolean JNICALL native_stack_frames_direct(
 ) {
     if (!frameBuffers || frameCount <= 0 || !outBuffer || width <= 0 || height <= 0 || channels <= 0) return JNI_FALSE;
 
-    size_t required = static_cast<size_t>(width) * height * channels;
+    // frameCount arrives as a jint and is not implied by the array: Java may pass
+    // any value. Past the end of the array GetObjectArrayElement raises
+    // ArrayIndexOutOfBoundsException, and the JNI specification forbids calling
+    // any further JNI function while an exception is pending. Validate the count
+    // against the real array length before touching the VM.
+    const jsize arrayLength = env->GetArrayLength(frameBuffers);
+    if (frameCount > arrayLength) {
+        LOGE("nativeStackFramesDirect: frameCount=%d exceeds array length %d",
+             frameCount, static_cast<int>(arrayLength));
+        return JNI_FALSE;
+    }
+
+    // stackAstroFrames() stops at MAX_STACK_FRAMES and drops the rest without
+    // saying so. Reject here instead of returning a stack built from fewer
+    // frames than the caller asked for.
+    if (frameCount > commix::ComputationalPhotoEngine::MAX_STACK_FRAMES) {
+        LOGE("nativeStackFramesDirect: frameCount=%d exceeds engine maximum %d",
+             frameCount, commix::ComputationalPhotoEngine::MAX_STACK_FRAMES);
+        return JNI_FALSE;
+    }
+
+    const size_t required = checkedImageBytes(width, height, channels);
+    if (required == 0) return JNI_FALSE;
     if (!validateDirectBuffer(env, outBuffer, required)) return JNI_FALSE;
 
-    std::vector<const uint8_t*> pointers(frameCount);
+    std::vector<const uint8_t*> pointers(static_cast<size_t>(frameCount));
     for (int i = 0; i < frameCount; ++i) {
         jobject buf = env->GetObjectArrayElement(frameBuffers, i);
         if (!buf) {
+            // Either a null element or a pending exception: stop issuing JNI
+            // calls immediately, do not clear the exception.
             return JNI_FALSE;
         }
         if (!validateDirectBuffer(env, buf, required)) {
@@ -398,7 +498,7 @@ static const JNINativeMethod g_telemetry_methods[] = {
     {(char*)"nativeWriteImu", (char*)"(FFF)V", (void*)native_write_imu},
     {(char*)"nativeWriteLens", (char*)"(FI)V", (void*)native_write_lens},
     {(char*)"nativeComputeScopesDirect", (char*)"(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;IIIIII)V", (void*)native_compute_scopes_direct},
-    {(char*)"nativeReadTelemetry", (char*)"([F[I[F)Z", (void*)native_read_telemetry}
+    {(char*)"nativeReadTelemetry", (char*)"([F[I[F[F)Z", (void*)native_read_telemetry}
 };
 
 static const JNINativeMethod g_engine_methods[] = {
@@ -407,6 +507,7 @@ static const JNINativeMethod g_engine_methods[] = {
     {(char*)"nativeApplyUnsharpMaskDirect", (char*)"(Ljava/nio/ByteBuffer;IIIFF)V", (void*)native_apply_unsharp_mask_direct},
     {(char*)"nativeApplyCdlDirect", (char*)"(Ljava/nio/ByteBuffer;IIIFFFFFFFFFF)V", (void*)native_apply_cdl_direct},
     {(char*)"nativeStartImuLogging", (char*)"()V", (void*)native_start_imu_logging},
+    {(char*)"nativePushImuSample", (char*)"(JFFFFFF)V", (void*)native_push_imu_sample},
     {(char*)"nativeStopAndExportGyroflow", (char*)"(Ljava/lang/String;Ljava/lang/String;D)Z", (void*)native_stop_and_export_gyroflow},
     {(char*)"nativePushBestShotVelocity", (char*)"(FFF)V", (void*)native_push_best_shot_velocity},
     {(char*)"nativeEvaluateBestShot", (char*)"(FFF[F)Z", (void*)native_evaluate_best_shot},
@@ -463,7 +564,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
         }
     }
 
-    LOGI("Commix JNI bridges successfully registered with JNI_OnLoad");
+    LOGI("Successfully registered JNI native methods for Commix");
     return JNI_VERSION_1_6;
 }
-

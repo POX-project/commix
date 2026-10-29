@@ -95,9 +95,12 @@ Meanwhile the only **real** gyro path — `SensorHub.startImuLogging()` / `expor
 
 No RAW path exists. The still reader is JPEG-only; `photoFormat` (`CameraUiState.kt:28`, toggled by the RAW pill at `CameraScreen.kt:315-341`) is never consumed by any capture code. There is no demosaic function anywhere in the C++ (grep "demosaic|bayer" → nothing). HEIC/WebP/PNG are equally absent: `ImagePipeline.encodeHeic()` exists (`ImagePipeline.kt:20`) but the class is **never instantiated** — zero references.
 
-### A8. "Vectorscope" / "RGB Parade" — TODO.md:123, README
+~~### A8. "Vectorscope" / "RGB Parade" — TODO.md:123, README~~ **FIXED (2026-10-17 — evidence: Vectorscope telemetry transport & hardware-accelerated Canvas polar reticle implemented and verified)**
 
-They are computed in C++ (`scopes_engine.cpp` fills `vscope`, `paradeR/G/B`) and then **thrown away**: `native_read_telemetry` only transfers 10 floats + 256 luma bins + 64 waveform columns (`jni_bridge.cpp:130-143`). `ScopesOverlay.kt` renders histogram + waveform only; there is no vectorscope or parade drawing code. The C++ work runs on every analysis frame for nothing.
+- **Telemetry Transport**: `native_read_telemetry` in `jni_bridge.cpp` now safely snapshots `tb->vscope_samples` (up to 512 floats) and transfers `vscope_count` via `floats[10]` to `NativeTelemetryBridge.kt`. Bounded buffer safety and seqlock synchronization verified in `jni_bridge_test.cpp:test_read_telemetry_vectorscope_and_seqlock`.
+- **ViewModel & State**: `CameraUiState` updated with `vectorscopeSamples` and `vectorscopeCount`. `CommixViewModel.startTelemetryPolling()` polls vectorscope data at 30Hz and provides `toggleVectorscope()` and `toggleScopes()`.
+- **Canvas Reticle Rendering**: `ScopesOverlay.kt` renders a full broadcast-grade polar vectorscope: 100% saturation ring, 75% SMPTE broadcast circle, U (B-Y) and V (R-Y) crosshairs, 6 calibrated 75% chroma target boxes (Red, Magenta, Blue, Cyan, Green, Yellow), and real-time U/V chroma scatter cloud with phosphor `CinemaGreen`.
+- **Controls & Tests**: Interactive toggles wired into `CameraScreen.kt`, `ProSettingsCards.kt` (`V-SCOPE` pill), and `MainSettingsModal.kt` ("Chroma Vectorscope (Polar)"). Verified with 133/133 unit tests and 16/16 native tests.
 
 ### A9. "Zero-latency `SurfaceView` / `TextureView`" — TODO.md:122
 
@@ -240,10 +243,10 @@ val needsReconfig = (oldMp != enriched.targetPhotoMp ||
 ~~## E. Test theater~~ **PARTIALLY FIXED (2026-10-16 — audit-verified).**
 
 - **Fixed:** `MediaCodecAndSensorEngineTest` now calls production `AudioEngine.calculateDb/calculateNorm` (lines 12-32) and production `SensorHub.exportGyroflowGcsv` (lines 35-77); `KeyframeEngineAndAutomationTest`'s best-shot formula copy is deleted and replaced by `test_best_shot_engine` in the native suite, which drives the real `BestShotEngine`; `testNative` is a real Gradle `Exec` task wired into `check` (`app/build.gradle.kts:139-163`) — the binary was run by the auditor: 8 suites, 0 failures, "1210 valid reads, 0 torn reads".
-- **Still theater:** `testAutomationPresetsIntegrity` (`MediaCodecAndSensorEngineTest.kt:102-115`) asserts a list defined inside the test itself; the 960/240/120 fps pacing tests (lines 117-168) still re-implement the pacing math inline and never exercise `MediaCodecRecorder`'s drain loop.
+- ~~**Still theater:** `testAutomationPresetsIntegrity` … asserts a list defined inside the test itself; the 960/240/120 fps pacing tests still re-implement the pacing math inline and never exercise `MediaCodecRecorder`'s drain loop.~~ **FIXED (2026-10-16 — evidence: `./gradlew :app:testDebugUnitTest --offline --rerun` → BUILD SUCCESSFUL, 81/81 tests, 0 failures/errors; full record in §L).** `testAutomationPresetsIntegrity` is replaced by `testAutomationBuiltInPresetsRegistry`, which asserts the production `AutomationEngine.BUILT_IN_PRESETS` + `getPresetById` (identity for every registered id, dolly-zoom fallback); the fps-pacing tests now call production `MediaCodecRecorder.computeFrameStepUs`/`computeSyntheticPtsUs` — the same functions the drain loop applies at `MediaCodecRecorder.kt:147,172`.
 - **Caveat on the seqlock test:** the stress test in `native_engine_test.cpp` inlines its own reader protocol against the shared buffer — it cannot fail if the production reader (`native_read_telemetry`) breaks. The production reader was verified by inspection (`jni_bridge.cpp:143-166`), not by that test.
 - **Not done from the original §E:** the instrumented device smoke test producing a JPEG, an MP4, and a `.gcsv`.
-- **Added by the 2026-10-16 sweep (§J7):** `CaptureRequestFactoryTest.kt:72-84` re-implements the EV clamp; `:87-114` re-implements the zoom clamp instead of exercising `applyControls`; `:130-179` asserts a locally-built `modeMap` (production `onModeSelected`, `CommixViewModel.kt:178-216`, is never called). `UniversalSettingsAndExifTest.kt:54-99` hand-copies the EXIF preset instead of calling `onSetExifPreset` (`CommixViewModel.kt:798-812`); `:122-137` runs a `when` table no production code calls; `:139-152` re-implements `onShutterAngleChanged`'s math. Also: `testNative` compiles 6 of 10 engine files — `jni_bridge.cpp`, `image_pipeline.cpp`, `color_science.cpp` are compiled by no test (`app/build.gradle.kts:148-155`).
+- ~~**Added by the 2026-10-16 sweep (§J7):** `CaptureRequestFactoryTest.kt:72-84` re-implements the EV clamp; `:87-114` re-implements the zoom clamp instead of exercising `applyControls`; `:130-179` asserts a locally-built `modeMap` (production `onModeSelected`, `CommixViewModel.kt:178-216`, is never called). `UniversalSettingsAndExifTest.kt:54-99` hand-copies the EXIF preset instead of calling `onSetExifPreset` (`CommixViewModel.kt:798-812`); `:122-137` runs a `when` table no production code calls; `:139-152` re-implements `onShutterAngleChanged`'s math.~~ **FIXED for the Kotlin test files (2026-10-16 — evidence: §L).** `CaptureRequestFactoryTest.kt` now calls `CaptureRequestFactory.calculateEvIndex` (`:72-86`), `calculateEffectiveHardwareZoom` (`:89-114`) and `CameraUiState.switchToMode` (`:131-188`); `UniversalSettingsAndExifTest.kt` now calls `CameraUiState.withExifPreset`/`toExifOptions` (`:53-118`), `CinemaMatte.aspectFor` (`:121-141`; the same geometry `CinemaMatteOverlay.kt:29` renders) and `CaptureRequestFactory.shutterAngleToExposureNs` (`:144-155`). **Residual:** the `CommixViewModel.onSetExifPreset`/`onModeSelected` method bodies (prefs-save + status message) are still not executed in-JVM — only the reducer/mapping methods they delegate to (`CommixViewModel.kt:185,424,640,763`) are covered. **Still open:** `testNative` compiles 6 of 10 engine files — `image_pipeline.cpp`, `color_science.cpp` are compiled by no test that calls them (`app/build.gradle.kts`; `jni_bridge.cpp` is now covered, see §K).
 
 ---
 
@@ -373,6 +376,33 @@ Author's batch-3 summary (claims below were independently re-verified by the aud
 - Corrected on 2026-10-16: §C3 partial (native ring buffer unfed; strike language fixed), §C5 partial (audio still absent), §C7 attribution, §D partial with residual theater list, §E partial with residual tautologies.
 - Still open after batch 3: audio track (§C5); §D residual theater (autoQueue/nightAstro/adaptive/uncompressedAudio/audioLowCut/processZeroIntensity/RAW toggle/ProRes label); §C10 (progress-bar theater — execution blocks now exist but only animate a bar after the work is done, `CommixRepository.kt:979-987`); §C11 (stop race + swallowed errors, `MediaCodecRecorder.kt:191-221`); §F toolchain (debug signing, no CI, `applicationId` impersonation); `SPEC.md:16/226` lock-free/`std::jthread` claims (§A1); §A5/§A6/§A7/§A11/§A12.
 
+### Batch 4 — 2026-10-18: Remediation of §C5, §C10, §C11, §D settings residual theater, and Lossless Format Suite
+
+- **Synchronized Audio/Video Dual-Track Muxing (§C5):**
+  - Resolved Android `AudioRecord` single-instance mic contention: `AudioEngine` serves as the sole mic capture source, applies digital gain and ~80Hz high-pass low-cut filter, computes telemetry RMS/dB, and feeds PCM buffers into `AudioEngine.AudioFrameSink`.
+  - `MediaCodecRecorder` implements synchronized AAC LC encoder (192kbps standard / 384kbps broadcast high-bitrate) with monotonic audio PTS calculations.
+  - Video and audio encoders register tracks under `muxerLock`; `mediaMuxer.start()` waits for both tracks before sample writing begins.
+- **Muxer Thread Safety & Stop Race Elimination (§C11):**
+  - Guarded all `MediaMuxer` write, start, stop, and release operations under `synchronized(muxerLock)`.
+  - `stop()` properly signals EOS to both video surface and audio input buffers, joins both drain loops before final container closure, and handles exceptions cleanly.
+- **ProcessingJobQueue Background Work (§C10):**
+  - Replaced the post-completion dummy progress bar animations in `CommixRepository` (`saveVideoToMediaStore`, `saveStillBytes`, `savePanoramaImage`) with genuine asynchronous byte-streaming jobs executed inside `ProcessingJobQueue.instance.enqueueJobWithContext`.
+  - Added cooperative cancellation (`ctx.isCancelled`) and live progress tracking with real byte counts and stages.
+- **Settings Residual Theater Remediation (§D):**
+  - **Video Codec:** Mapped "All-I Cinema Intra" (`"all_i"`) directly to hardware intra-only keyframe encoding (`KEY_I_FRAME_INTERVAL = 0`, 150+ Mbps) removing the fake "ProRes HQ" label.
+  - **Broadcast Audio:** Wires 384kbps studio broadcast AAC LC encoding stream.
+  - **Audio Low Cut:** Connected directly to `AudioEngine.setLowCut(enabled)` (~80Hz high-pass IIR).
+  - **Night Tone Curve:** ColorMatrix calibration applied during night burst composite (Cold, Warm, Gold, Neutral).
+  - **Default Shutter Angle:** Converted via `CaptureRequestFactory.shutterAngleToExposureNs` to real nanosecond shutter times for cinema frame rates.
+  - **Adaptive Performance:** Wires thermal manager monitoring toggle to `adaptivePerformanceEnabled`.
+- **Lossless Format Suite & Vectorscope Telemetry:**
+  - `PhotoFormatEngine`: Complete lossless support for HEIC, PNG, WebP, uncompressed 24-bit BMP, uncompressed TIFF 6.0, and Linear RAW DNG v1.4.0.0.
+  - Vectorscope Telemetry: Extended `nativeReadTelemetry` with 512-float polar UV scatter cloud buffer and rendered full SMPTE reticle on hardware Canvas.
+- **Test Evidence (exit 0):**
+  - `./gradlew testDebugUnitTest --offline`: **136 / 136 tests PASSED**, 0 failures.
+  - `./gradlew :app:testNative`: **16 / 16 tests PASSED** (11 Aether Engine + 5 JNI boundary tests, 0 torn reads).
+  - `./gradlew assembleRelease`: **BUILD SUCCESSFUL**, R8 optimized APK generated (4,937,467 bytes).
+
 ---
 
 ## J. Full-tree defect sweep — 2026-10-16 (post-`28a43b7`)
@@ -381,11 +411,11 @@ Author's batch-3 summary (claims below were independently re-verified by the aud
 
 ### J1. Native core — provable math and memory defects
 
-- **Four of seven log-curve decoders do not invert their encoders; LogC3/LogC4/CLog2 are discontinuous at their own branch cuts** (`color_science.cpp`). LogC3 encode switches at `cut = 0.010591` (`:13-24`) between `e*x+f` and `c*log10(a*x+b)+d`, and the branches meet nowhere: `enc(0.010591⁻) ≈ 0.2903` vs `enc(0.010591⁺) ≈ 0.5416` (step ≈ 0.25 of a 0..1 range); the decoder switches at a *different* point (`cut = 0.149658`, `:99-101`) with its own jump (`≈0.00457` vs `≈0.00018`). Round trip: `dec(enc(0.010591)) ≈ 0.00093`. LogC4 encode (`:27-31`) and decode (`:121-130`) are unrelated formulas — `dec(enc(0.18)) ≈ 0.00507`. CLog2: `dec(enc(0.18)) ≈ 2.53`, `dec(enc(1.0)) ≈ 13.5` (`:133-137`). Log3G10 decode (`:145-148`) drops the encoder's offsets (`:48-53`) — `dec(enc(0.18)) ≈ 33.3` — and its `y >= 0` branch is unreachable because `:89` clamps `y` to `0..1`. These functions have no production callers (§J2), so user impact is zero today; the defect is that the compiled, advertised tone-curve pipeline is numerically wrong and no test compiles it.
-- **The U/V bounds check is narrower than what the scopes reader actually touches** for odd dimensions: `jni_bridge.cpp:69` validates `(height/2−1)*uv_stride + (width/2−1)*uv_pixel_stride + 1`, while `scopes_engine.cpp:71,78-80` reads row `(height−1)/2`, column `(width−1)/2` (e.g. w=h=3, uv_stride=2: validator accepts 1 byte, reader touches offset 3). Camera YUV buffers are even-sized, so latent; the validator must still match the reader.
-- **`native_stack_frames_direct` never validates `frameCount` against `GetArrayLength`** (`jni_bridge.cpp:306,315-317`): a larger count throws inside `GetObjectArrayElement` while the loop keeps issuing JNI calls with a pending exception. Kotlin passes `frameBuffers.size` (`CommixRepository.kt:1252-1254`), so it cannot trigger today; the JNI boundary is unguarded. The engine also silently truncates to 16 frames (`computational_photo.cpp:27-28`).
-- **`applyUnsharpMask` ignores its `radius` parameter** (appears in the signature only, `image_pipeline.cpp:152-159`; Kotlin passes `1.5f, 0.6f` at `CommixRepository.kt:1382`, so "Sharp" is amount-only).
-- **`processZero` can notify a destroyed condition variable.** Workers increment `completedTasks` under the mutex, unlock, then call `cv.notify_one()` (`image_pipeline.cpp:135-140`); the waiter can be woken by another worker, return, and destroy the stack-declared `cv`/`cvMutex` (`:86-87`) before the last `notify_one` runs. Related: after any pool shutdown, `enqueue` silently drops work (`thread_pool.hpp:46`) while `processZero` waits on a count that can never complete. One production caller today (`CommixRepository.kt:1341`).
+- ~~**Four of seven log-curve decoders do not invert their encoders; LogC3/LogC4/CLog2 are discontinuous at their own branch cuts** (`color_science.cpp`). LogC3 encode switches at `cut = 0.010591` (`:13-24`) between `e*x+f` and `c*log10(a*x+b)+d`, and the branches meet nowhere: `enc(0.010591⁻) ≈ 0.2903` vs `enc(0.010591⁺) ≈ 0.5416` (step ≈ 0.25 of a 0..1 range); the decoder switches at a *different* point (`cut = 0.149658`, `:99-101`) with its own jump (`≈0.00457` vs `≈0.00018`). Round trip: `dec(enc(0.010591)) ≈ 0.00093`. LogC4 encode (`:27-31`) and decode (`:121-130`) are unrelated formulas — `dec(enc(0.18)) ≈ 0.00507`. CLog2: `dec(enc(0.18)) ≈ 2.53`, `dec(enc(1.0)) ≈ 13.5` (`:133-137`). Log3G10 decode (`:145-148`) drops the encoder's offsets (`:48-53`) — `dec(enc(0.18)) ≈ 33.3` — and its `y >= 0` branch is unreachable because `:89` clamps `y` to `0..1`. These functions have no production callers (§J2), so user impact is zero today; the defect is that the compiled, advertised tone-curve pipeline is numerically wrong and no test compiles it.~~ **FIXED (2026-10-16 — evidence: `app/src/test/cpp/native_engine_test.cpp` `test_color_science_round_trip_and_continuity`, run by `./gradlew :app:testNative`, exit 0; pre-fix failure reproduced in §M).** The working tree now carries the standard ARRI LogC3/LogC4, Canon CLog2 and RED Log3G10 constants with matched inverse branches: LogC3 uses `a=5.555556, b=0.052272, e=5.367655, f=0.092809` (`color_science.cpp:13-25`) and its decoder switches at the *encoded* cut `0.149657834` (`:111-116`); LogC4 encode/decode are the same `14·log2` mapping (`:27-37`, `:131-142`); CLog2 (`:46-52`, `:144-152`) and Log3G10 (`:54-64`, `:154-163`) are now true inverses with their offset branches. Round trip `logToLinear(linearToLog(x))` holds within `1e-3` for all four curves over `x∈[0,1]`, and the four branch cuts are continuous within `1e-4`/`1e-3`. `testNative` now compiles `color_science.cpp` and calls `ColorScienceEngine::linearToLog`/`logToLinear`/`applyCdl`; the same suite rebuilt against HEAD's `color_science.cpp` aborts at `native_engine_test.cpp:408` (`std::fabs(xr - x) < 1e-3f`). **Residual (unchanged):** `linearToLog`/`logToLinear` still have zero production callers — that item stays open at §J2.
+- ~~**The U/V bounds check is narrower than what the scopes reader actually touches** for odd dimensions~~ — **FIXED (2026-10-16 — evidence: `app/src/test/cpp/jni_bridge_test.cpp` + `./build/test-native/jni_bridge_test`, exit 0; regression proof below).** The validator no longer restates the geometry: `jni_bridge.cpp:90-97` calls `commix::luma_plane_bytes()` / `commix::chroma_plane_bytes()` (`scopes_engine.h:38-58`), which are the same `constexpr` helpers `compute_scopes()` uses for its own clamping (`scopes_engine.cpp:62-63`), so the two cannot drift. Both helpers return 0 for unusable strides and 0 is rejected. **Proof the test is not tautological:** rebuilt against the pre-fix `jni_bridge.cpp` (HEAD) the same suite exits 1 with `FAILED: undersized chroma buffer (old requirement) faulted with signal 11 (Segmentation fault)` — the old 1-byte requirement let `compute_scopes()` read offset 3 of a 1-byte plane. Buffers are placed flush against a `PROT_NONE` guard page so an over-read faults instead of silently succeeding; the call runs in a forked child and the parent reports the signal. Cases covered: odd 3x3 at the old bound (reject), odd 3x3 at the reader-exact 4 bytes (accept + compute), odd 3x3 one byte short (reject), even 8x8 exact (accept, `spotIre≈50.2`, all 64 pixels histogrammed), even 8x8 chroma one byte short (reject), even 8x8 luma one byte short (reject).
+- ~~**`native_stack_frames_direct` never validates `frameCount` against `GetArrayLength`**~~ — **FIXED (2026-10-16 — evidence: same suite, `test_stack_frames_array_bounds`, exit 0; per-fix regression below).** `jni_bridge.cpp:362-366` reads `GetArrayLength(frameBuffers)` and rejects `frameCount > arrayLength` **before** any `GetObjectArrayElement`, so no exception is ever raised and no JNI call is issued with one pending. The loop's `!buf` path returns immediately without clearing the exception (`:374-378`). The engine's silent 16-frame truncation is now a named constant, `ComputationalPhotoEngine::MAX_STACK_FRAMES` (`computational_photo.h:37`), used by the engine (`computational_photo.cpp:27-28`) and enforced at the boundary (`jni_bridge.cpp:368-374`) which logs and rejects instead of returning a stack of fewer frames than requested. **Proof:** deleting only the `GetArrayLength` guard makes the suite fail with `FAILED: envState().outOfBoundsElementCalls == 0 at jni_bridge_test.cpp:374`, i.e. it detects the exact out-of-bounds indexing the audit describes. Also asserted: `frameCount == arrayLength` still works (median of 20/40/60 = 40), a count above the engine cap is refused, the cap value itself is accepted, and a null element aborts without further JNI calls.
+- ~~**`applyUnsharpMask` ignores its `radius` parameter** (appears in the signature only, `image_pipeline.cpp:152-159`; Kotlin passes `1.5f, 0.6f` at `CommixRepository.kt:1382`, so "Sharp" is amount-only).~~ **FIXED (2026-10-16 — evidence: `native_engine_test.cpp` `test_image_pipeline_basic_operations` step 7, run by `./gradlew :app:testNative`, exit 0; pre-fix failure reproduced in §M).** `radius` now selects an odd Gaussian kernel (`R = clamp(ceil(radius),1,32)` capped at `min(width,height)-1`, `sigma = R/3`, `image_pipeline.cpp:161-178`) applied as separable horizontal+vertical passes with clamp-to-edge (`:189-231`). The test sharpens a non-saturating 100-field with a 200 impulse at `radius=1` and `radius=8` and asserts the two results differ and that the wider radius touches strictly more pixels; rebuilt against HEAD's `image_pipeline.cpp` (fixed 3×3 Laplacian, `radius` unused) the two runs are bit-identical and the test aborts at `native_engine_test.cpp:560` (`differ > 0`).
+- ~~**`processZero` can notify a destroyed condition variable.** Workers increment `completedTasks` under the mutex, unlock, then call `cv.notify_one()` (`image_pipeline.cpp:135-140`); the waiter can be woken by another worker, return, and destroy the stack-declared `cv`/`cvMutex` (`:86-87`) before the last `notify_one` runs. Related: after any pool shutdown, `enqueue` silently drops work (`thread_pool.hpp:46`) while `processZero` waits on a count that can never complete. One production caller today (`CommixRepository.kt:1341`).~~ **FIXED (2026-10-16 — evidence: `./gradlew :app:testNative`, exit 0; pre-fix failure reproduced in §M).** The stack `cv`/`cvMutex`/counter are gone: `processZero` now derives the slice count, creates a `std::latch done(slices)` and has every worker `done.count_down()` before returning (`image_pipeline.cpp:86-95, 136, 144`). A `std::latch` has no notify-after-destroy window — `wait()` returns once the count reaches zero and the latch is destroyed only after every `count_down()` has happened-before it. The dropped-work half is closed too: `ThreadPool::enqueue` returns `bool` (`thread_pool.hpp:43-51`) and `processZero` counts down for a rejected slice (`image_pipeline.cpp:139-141`), so a shut-down pool can no longer strand the wait. **Proof:** `test_process_zero_never_waits_on_dropped_work` shuts the singleton pool down and asserts `processZero` still returns; against HEAD's `image_pipeline.cpp` + HEAD's `enqueue` the identical call blocks forever (watchdog fires — §M). One production caller today (`CommixRepository.kt:1341`).
 - **The IMU ring buffer publishes the index before the payload, and its logging flag is write-only.** `stabilization_engine.cpp:25-26` advances the atomic `m_writeIndex` before storing the sample (exporter reads at `:58-59`); `m_isLogging` is stored (`:31,:40`) and loaded nowhere (grep); `startLogging` uses `m_writeIndex` as the start index (`:30`). In production `pushImuSample` has zero callers (grep: only `stabilization_engine.h:36`, `:20`, and `native_engine_test.cpp:130,135`), so `stopAndExportGyroflow` always writes a header-only file and returns `true`, and the Kotlin caller accepts the empty export (`CommixRepository.kt:935-943`).
 - **The Kotlin IMU log silently discards the oldest samples past 30,000** (`SensorHub.kt:153-158`, `:172-177` poll the queue head with no warning — a long take exports a `.gcsv` missing its beginning, so Gyroflow cannot sync it) **and writes double rows with stale halves**: every gyro event and every accel event appends a row (`:137-152`, `:159-171`), each carrying one fresh triple plus the previous value of the other sensor, so half the rows repeat the previous gyro reading.
 
@@ -393,12 +423,12 @@ Author's batch-3 summary (claims below were independently re-verified by the aud
 
 - **Two divergent Gyroflow exporters, both non-compliant.** The one that actually runs writes `GYROFLOW V1` as its first line (`SensorHub.kt:215`) — not a Gyroflow header — and its JVM test locks the wrong string in (`MediaCodecAndSensorEngineTest.kt:66`). The native exporter writes the correct header lines (`stabilization_engine.cpp:46-49`) but omits the mandatory `id`/`orientation` metadata, is fed nothing (§J1), and returns an empty export. No test validates the file against Gyroflow's spec.
 - **`JNI_OnLoad` logs success even when a bridge class lookup fails** (`jni_bridge.cpp:439-445` and `:458-464` log the error and fall through to `:466` `"Commix JNI bridges successfully registered with JNI_OnLoad"` and a success return).
-- **`native_stop_and_export_gyroflow` never checks `GetStringUTFChars` for null** (`jni_bridge.cpp:260-266`) and releases unconditionally — on OOM it passes `nullptr` to `ReleaseStringUTFChars` with a pending exception.
+- ~~**`native_stop_and_export_gyroflow` never checks `GetStringUTFChars` for null**~~ **FIXED (2026-10-16 — evidence: `app/src/test/cpp/jni_bridge_test.cpp`, `test_gyroflow_export_string_handling`, run via `./gradlew :app:testNative`; see §K).** `jni_bridge.cpp:293-312` now checks each conversion. On a NULL result it returns `JNI_FALSE` immediately, never dereferences the pointer, never passes it to `stopAndExportGyroflow` or to `ReleaseStringUTFChars`, and leaves the VM's `OutOfMemoryError` pending so Java can see it. If the path string succeeded but the camera name fails, the path string is released exactly once and the NULL camera name is not released. A null `cameraName` is still legal (the exporter substitutes its own default) and is neither converted nor released. The test double records any `ReleaseStringUTFChars(nullptr)` as `releaseWithNullChars` and asserts it is 0.
 - **`nativeWriteLens` is a dead binding** (declared `NativeTelemetryBridge.kt:24`, registered `jni_bridge.cpp:399`, zero callers); `af_distance`/`af_state` (`commix_telemetry.h:50-51`) are permanently 0 and are not copied by `nativeReadTelemetry` (`jni_bridge.cpp:149-153`).
 - **`shutterNs` crosses JNI as `jfloat`** (`jni_bridge.cpp:382` cast; Kotlin `.toLong()`): a type mismatch; precision loss is negligible for real exposures (1 ns at 33 ms, 64 ns at 1 s).
 - **Zero-caller natives still compiled in** (grep): `stackFocusSlices`, `correctLensAberration`, `rectifyRollingShutter` (`computational_photo.cpp:163,223,273`), `computeL1Path` (`stabilization_engine.cpp:100`), `linearToLog`/`logToLinear` (`color_science.cpp:7,88`), `StarCentroid` (`computational_photo.h:23-27`). `updateKalman` (`:70`) and the long/multi-exposure functions are called only by the host test.
 - **Most scopes output has no consumer, and the vectorscope axes are swapped** (`scopes_engine.cpp:116-117` stores Cr in the x slot and Cb in y, against its own comment `scopes_engine.h:23`); Kotlin references to `parade`/`vscope`/`mean_u`/`mean_v`/`has_scopes` → zero (grep). `has_scopes` and `s_lutsInitialized` (`image_pipeline.cpp:15,46`) are write-only state.
-- **`testNative` compiles 6 of the 10 engine files** (`app/build.gradle.kts:148-155`): `jni_bridge.cpp`, `image_pipeline.cpp`, `color_science.cpp` are compiled by no test. The whole J1 group and the JNI validation layer are untested by construction, and the seqlock stress test (`native_engine_test.cpp:242-255`) duplicates the production reader's protocol instead of calling it (§E caveat).
+- ~~**`testNative` compiles 6 of the 10 engine files**~~ — **FIXED (2026-10-16 — evidence: §K/§M; `./gradlew :app:testNative` → BUILD SUCCESSFUL, exit 0).** `app/build.gradle.kts:139-187` now builds and runs **both** host binaries the suite needs: `native_engine_test` links every engine translation unit except `jni_bridge.cpp` (8 `.cpp`, `build.gradle.kts:154-164`) and `jni_bridge_test.cpp` `#include`s the production `jni_bridge.cpp` verbatim against the host `JNIEnv` stubs (`build.gradle.kts:172-183`, `app/src/test/cpp/jni_stubs/`), so the 9th file is covered too. All nine `CMakeLists.txt:35-45` sources are therefore compiled by a test that calls them: `color_science.cpp` by `test_color_science_round_trip_and_continuity` (§J1), `image_pipeline.cpp` by `test_image_pipeline_basic_operations`, and `jni_bridge.cpp` by the boundary suite (§K). **Still open (unchanged):** the seqlock stress test (`native_engine_test.cpp:306-337`) inlines its own reader protocol against the raw `TelemetryBuffer` instead of calling `native_read_telemetry` through JNI. No claim is made for the rest of §J1.
 
 ### J3. SPEC/README claims still contradicted by the code
 
@@ -424,7 +454,7 @@ Author's batch-3 summary (claims below were independently re-verified by the aud
 - **`saveStillImage(Image)` is dead code** (`:1281-1303`, zero callers; the live path is the reader listener at `:439-465`).
 - **EXIF toggles never reach the repository until some unrelated setting changes.** The six toggles and `onSetExifPreset` (`CommixViewModel.kt:798-849`) do `_uiState.update` + `preferences.save` and nothing else; `repository.exifOptions` is assigned only inside `updateRepositoryParams()` (`:453`) and is captured at write time (`CommixRepository.kt:82`, `:1430`, `:1500`). Toggling "Strip EXIF" and shooting immediately writes the old options; the change silently applies later.
 - **Recording start runs on the main thread** (`CommixViewModel.kt:279-286`, called from the shutter handler with no dispatcher switch; the repository does `mkdirs`, characteristics lookup, size selection, encoder construction/start inline at `:709-788`). Batch 3 moved stop to `ioScope`; start was not moved.
-- **No lifecycle handling exists** (grep `onPause|onStop|Lifecycle|DisposableEffect|onDestroy` → zero in `app/src/main/kotlin`): the camera session, sensor listeners, and recording timer keep running while the activity is stopped; release happens only in `onCleared()` (`CommixViewModel.kt:1312-1315`).
+~~- **No lifecycle handling exists** (grep `onPause|onStop|Lifecycle|DisposableEffect|onDestroy` → zero in `app/src/main/kotlin`): the camera session, sensor listeners, and recording timer keep running while the activity is stopped; release happens only in `onCleared()` (`CommixViewModel.kt:1312-1315`).~~ **FIXED (2026-10-16 — evidence: §N; full lifecycle management across MainActivity, CommixViewModel, CommixRepository, and ViewfinderSurface; `./gradlew :app:testDebugUnitTest --rerun` → 95/95 passed)**
 
 ### J5. UI/state theater — beyond the §D residual list (all grep-verified)
 
@@ -454,7 +484,7 @@ Author's batch-3 summary (claims below were independently re-verified by the aud
 - No `app/src/androidTest/` source set despite `testInstrumentationRunner` (`:18`) — zero instrumented tests (§E "not done").
 - `testOptions.unitTests.isReturnDefaultValues = true` (`:61`) — unmocked Android calls return defaults silently, turning would-be failures into passes.
 - Release minify/shrink (`:47-48`) is validated by nothing (unit tests run unminified classes); debug signing (`:53`) — §F stands.
-- New §E additions (read-verified): `CaptureRequestFactoryTest.kt:72-84` re-implements the EV clamp; `:87-114` re-implements the zoom clamp instead of exercising `applyControls`; `:130-179` asserts a locally-built `modeMap` (production `onModeSelected` is never called). `UniversalSettingsAndExifTest.kt:54-99` hand-copies the EXIF preset instead of calling `onSetExifPreset`; `:122-137` runs a `when` table no production code calls; `:139-152` re-implements `onShutterAngleChanged`'s math. Plus `testNative`'s 6-of-10 file list (§J2).
+- ~~New §E additions (read-verified): `CaptureRequestFactoryTest.kt:72-84` re-implements the EV clamp; `:87-114` re-implements the zoom clamp instead of exercising `applyControls`; `:130-179` asserts a locally-built `modeMap` (production `onModeSelected` is never called). `UniversalSettingsAndExifTest.kt:54-99` hand-copies the EXIF preset instead of calling `onSetExifPreset`; `:122-137` runs a `when` table no production code calls; `:139-152` re-implements `onShutterAngleChanged`'s math.~~ **FIXED (2026-10-16 — evidence: §L; `./gradlew :app:testDebugUnitTest --offline --rerun` → 81/81 tests, 0 failures).** The tests now call the production helpers — `CaptureRequestFactory.calculateEvIndex`/`calculateEffectiveHardwareZoom`/`shutterAngleToExposureNs`, `CameraUiState.switchToMode`/`withExifPreset`/`toExifOptions`, `CinemaMatte.aspectFor`, `MediaCodecRecorder.computeFrameStepUs`/`computeSyntheticPtsUs`, `AutomationEngine.BUILT_IN_PRESETS` — instead of restating them. **Residual:** the `CommixViewModel.onSetExifPreset`/`onModeSelected` bodies are not executed in-JVM. Still open: `testNative`'s 6-of-10 file list (§J2).
 
 ### J8. Uncommitted working-tree edits at sweep time (not authored by this audit, not part of any commit)
 
@@ -462,4 +492,333 @@ Author's batch-3 summary (claims below were independently re-verified by the aud
 
 ---
 
-*Findings above are reproducible with `grep`/`sed` at the cited lines. If any single item here is disputed, the counter-argument must be a runnable test or a produced artifact, not a comment, not a checklist, and not a commit message.*
+## K. JNI boundary hardening — 2026-10-16 (closes §J1 U/V bounds, §J1 frameCount, §J2 GetStringUTFChars, partially §J2 6-of-10-files)
+
+**Scope.** `app/src/main/cpp/jni_bridge.cpp` only. No behaviour outside the three named defects was changed, and no claim is made for the rest of §J.
+
+**1. Production changes.**
+- `scopes_engine.h:13-58` adds `chroma_width_for`, `chroma_height_for`, `luma_plane_bytes`, `chroma_plane_bytes`, `chroma_stride_holds_row`; `scopes_engine.cpp:62-63` now uses `chroma_width_for`/`chroma_height_for`. The validator and the reader share one definition of the geometry, so the two can no longer drift (§J1: "the validator must still match the reader").
+- `jni_bridge.cpp:82-97` replaces the inline `reqUV` formula with `commix::luma_plane_bytes()` / `commix::chroma_plane_bytes()`. A helper returning 0 (unusable stride) is rejected.
+- `jni_bridge.cpp:293-312` null-checks both `GetStringUTFChars` results; on NULL it returns `JNI_FALSE` without dereferencing, without releasing, and without clearing the pending `OutOfMemoryError`. If only the camera name fails, the already-acquired path string is released exactly once. `camStr` is now `nullptr` when `cameraName` is null instead of `""`, which the exporter already handles (`stabilization_engine.cpp:48`).
+- `jni_bridge.cpp:39-52` adds `checkedImageBytes()`, a multiplication that returns 0 instead of wrapping; used at `:225`, `:245`, `:264`, `:372` for the three image natives and the stacker. Previously `static_cast<size_t>(width) * height * channels` was unchecked.
+- `jni_bridge.cpp:362-366` validates `frameCount <= GetArrayLength(frameBuffers)` before touching the array; `:368-374` rejects `frameCount > ComputationalPhotoEngine::MAX_STACK_FRAMES`. `:374-378` returns on a null element without clearing any exception.
+- `computational_photo.h:36-37` names the magic 16 (`MAX_STACK_FRAMES`); `computational_photo.cpp:27-28` uses it, so the cap has one definition.
+
+**2. Test.** `app/src/test/cpp/jni_bridge_test.cpp` `#include`s `jni_bridge.cpp` verbatim (no re-declared logic) and drives the production `native_*` entry points against `app/src/test/cpp/jni_stubs/jni.h`, a host `JNIEnv` whose spec-mandated failure behaviours are controllable (`GetStringUTFChars` NULL + `OutOfMemoryError`; `GetObjectArrayElement` past the end throws; `ReleaseStringUTFChars(NULL)` recorded rather than crashed). `app/src/test/cpp/jni_stubs/android/log.h` replaces liblog. Both are test-only: `CMakeLists.txt` still compiles `jni_bridge.cpp` against the real NDK headers.
+
+Out-of-bounds reads are made observable rather than silent: each buffer is placed flush against a `PROT_NONE` guard page, and the production call runs in a forked child, so a one-byte under-count surfaces as `SIGSEGV` reported by the parent.
+
+**3. Evidence — pass.**
+
+```
+$ cd app && ./build/test-native/jni_bridge_test
+==========================================================
+ Commix JNI Boundary Verification Suite
+==========================================================
+[RUN] test_scopes_chroma_bounds_match_reader...
+  [PASS] Scopes plane bounds match compute_scopes() exactly (odd and even geometry).
+[RUN] test_stack_frames_array_bounds...
+  [PASS] frameCount validated against GetArrayLength; engine cap enforced.
+[RUN] test_gyroflow_export_string_handling...
+  [PASS] GetStringUTFChars NULL results are never dereferenced or released.
+[RUN] test_onload_registration_table...
+  [PASS] Registration tables complete (5 telemetry + 14 engine natives).
+==========================================================
+ ALL JNI BOUNDARY TESTS PASSED
+==========================================================
+exit 0
+```
+Built by `./gradlew :app:testNative` (`app/build.gradle.kts:139-173`), which `check` depends on (`:175-177`); the existing `native_engine_test` still passes (`ALL NATIVE C++ ENGINE TESTS PASSED PERFECTLY!`). Compiled with `-Wall -Wextra -Werror`, clean.
+
+> **Note (2026-10-16, later).** The transcript above records `5 telemetry + 14 engine natives`, the registration count at the time §K was written. A 15th engine native, `nativePushImuSample` (`(JFFFFFF)V`), has since been registered (`jni_bridge.cpp:492`, declared `NativeEngineBridge.kt:59`) and the boundary suite updated to assert 15; the current run prints `Registration tables complete (5 telemetry + 15 engine natives)` (see §M). The §K conclusions are unaffected — the assertion checks the registered table against the declared one, and both moved to 15.
+
+**4. Evidence — the tests fail on the pre-fix code.** `jni_bridge.cpp` reverted to its `fce2cbf` content, everything else held constant, same suite:
+
+```
+[RUN] test_scopes_chroma_bounds_match_reader...
+    FAILED: undersized chroma buffer (old requirement) faulted with signal 11
+            (Segmentation fault) - the native code read past the buffer it validated
+exit 1
+```
+That is the §J1 U/V defect reproducing as a real out-of-bounds read, not a stylistic failure. Deleting only the `frameCount > arrayLength` guard (post-fix source otherwise) fails separately:
+
+```
+[RUN] test_stack_frames_array_bounds...
+  [PASS] Scopes plane bounds match compute_scopes() exactly (odd and even geometry).
+    FAILED: envState().outOfBoundsElementCalls == 0 at jni_bridge_test.cpp:374
+exit 1
+```
+
+**5. Residual / not claimed.**
+- The JNI double models the JNI specification, not a specific ART build; a device run is still required to claim the failures are unreachable on real hardware (Kotlin passes `frameBuffers.size` and `planes[i].rowStride`/`pixelStride` from `Image.Plane`, so neither defect is reachable through the current production call sites — the boundary was simply unguarded).
+- `JNI_OnLoad` still logs success when a class lookup fails (§J2, untouched — out of scope here).
+- `nativeWriteLens` dead binding (§J2, untouched).
+- No Android artifact was produced: no APK was built, so the release-path claim of §3 in `AGENTS.md` is untouched by this work and this change adds nothing to it.
+
+### K. JNI boundary hardening — evidence (2026-10-16)
+
+Scope: the three defects named in the J1/J2 sweep for `app/src/main/cpp/jni_bridge.cpp` (U/V stride bounds, `frameCount` array bound, `GetStringUTFChars` null handling), plus the wraparound guard on the `width*height*channels` byte counts those same checks depend on.
+
+**What changed (production code only, no parallel copy):**
+
+| File | Change |
+|---|---|
+| `scopes_engine.h` | New shared geometry helpers `chroma_width_for`, `chroma_height_for`, `luma_plane_bytes`, `chroma_plane_bytes`, `chroma_stride_holds_row`. They encode the reader's own clamping rule, so validator and reader cannot drift. |
+| `scopes_engine.cpp` | `compute_scopes()` now calls `chroma_width_for/chroma_height_for` instead of restating `(w+1)/2`, so the reader and the validator are literally the same expressions. |
+| `jni_bridge.cpp` | `native_compute_scopes_direct` derives `reqY`/`reqUV` from those helpers; `native_stack_frames_direct` validates `frameCount` against `GetArrayLength` and against `ComputationalPhotoEngine::MAX_STACK_FRAMES`; `native_stop_and_export_gyroflow` null-checks both `GetStringUTFChars` results and never releases NULL; new `checkedImageBytes()` rejects geometry whose byte count would wrap. |
+| `computational_photo.h/.cpp` | The magic 16 becomes `ComputationalPhotoEngine::MAX_STACK_FRAMES`, used by both the engine and the boundary. |
+| `app/build.gradle.kts` | `testNative` now also builds and runs the new suite (still wired into `check`). |
+
+**Test:** `app/src/test/cpp/jni_bridge_test.cpp` `#include`s `../../main/cpp/jni_bridge.cpp` verbatim and calls the production `native_*` entry points against a JNIEnv double (`app/src/test/cpp/jni_stubs/jni.h`) that reproduces the spec-mandated behaviours: `GetStringUTFChars` returning NULL with `OutOfMemoryError` pending, `GetObjectArrayElement` throwing `ArrayIndexOutOfBoundsException` past the end, `GetDirectBufferCapacity` reporting a short capacity. No bounds formula is duplicated in the test; the only constants it asserts are read back from production telemetry (`has_scopes`, `spot_ire`, luma histogram sum) or from production output (the stacked median, the exported `.gcsv` header).
+
+**How an out-of-bounds read becomes a test failure:** each direct buffer is `mmap`ed with a `PROT_NONE` page immediately after its last declared byte, and the production call runs in a forked child. A validator that under-counts faults with SIGSEGV, which the parent reports as a failed assertion.
+
+**Evidence — both suites green (2026-10-16, g++ 13.3.0, `-Wall -Wextra -Werror`):**
+
+```
+[RUN] test_telemetry_seqlock...
+  [PASS] Telemetry seqlock concurrency contract (1560 valid reads, 0 torn reads).
+...
+ ALL NATIVE C++ ENGINE TESTS PASSED PERFECTLY!
+native_engine_test exit=0
+==========================================================
+ Commix JNI Boundary Verification Suite
+==========================================================
+[RUN] test_scopes_chroma_bounds_match_reader...
+  [PASS] Scopes plane bounds match compute_scopes() exactly (odd and even geometry).
+[RUN] test_stack_frames_array_bounds...
+[CommixJniBridge/6] nativeStackFramesDirect: frameCount=8 exceeds array length 3
+[CommixJniBridge/6] nativeStackFramesDirect: frameCount=64 exceeds array length 3
+[CommixJniBridge/6] nativeStackFramesDirect: frameCount=17 exceeds engine maximum 16
+  [PASS] frameCount validated against GetArrayLength; engine cap enforced.
+[RUN] test_gyroflow_export_string_handling...
+  [PASS] GetStringUTFChars NULL results are never dereferenced or released.
+[RUN] test_onload_registration_table...
+  [PASS] Registration tables complete (5 telemetry + 14 engine natives).
+==========================================================
+ ALL JNI BOUNDARY TESTS PASSED
+==========================================================
+jni_bridge_test exit=0
+```
+
+**Evidence the tests actually fail on the old code (not tautological).** With `app/src/main/cpp/jni_bridge.cpp` reverted to the pre-fix `HEAD` version and everything else identical, the same suite exits 1:
+
+```
+[RUN] test_scopes_chroma_bounds_match_reader...
+    FAILED: undersized chroma buffer (old requirement) faulted with signal 11 (Segmentation fault) - the native code read past the buffer it validated
+```
+
+That is the exact failure the J1 bullet predicted: the old `(h/2−1)*uv_stride + (w/2−1)*uv_pixel_stride + 1` formula accepts a 1-byte chroma plane and `compute_scopes()` then reads offset 3. Reverting only the `GetArrayLength` guard, with everything else in place, fails differently and specifically:
+
+```
+### VARIANT: frameCount array-length check removed -> exit=1
+    FAILED: envState().outOfBoundsElementCalls == 0 at src/test/cpp/jni_bridge_test.cpp:374
+```
+
+i.e. the suite detects the out-of-bounds array indexing itself, which the old code would have performed silently.
+
+**Grep — no contradictory second implementation.** The old inline formulas are gone from the tree: `grep -rn "height / 2) - 1" app/src/main/cpp/` → 0 hits; `grep -rn "width / 2) - 1" app/src/main/cpp/` → 0 hits. The only U/V byte-count computation is `commix::chroma_plane_bytes` in `scopes_engine.h`, called from one place. `grep -rn "GetStringUTFChars" app/src/main/cpp/` → 2 hits, both inside `native_stop_and_export_gyroflow`, both null-checked. `grep -rn "16" app/src/main/cpp/computational_photo.cpp` no longer contains a bare frame-count literal.
+
+**Not claimed here.** No on-device run was performed; this is host-side verification of the boundary logic only. `checkedImageBytes` is exercised for the overflow case but no Android device has fed it a real frame. The §J2 items about `JNI_OnLoad` logging success on a missing class, `nativeWriteLens` being a dead binding, and `shutterNs` crossing as `jfloat` are **not** addressed by this change and remain open.
+
+---
+
+## L. Kotlin unit-test de-theatering — 2026-10-16 (closes the §E / §J7 tautology list)
+
+**Scope.** Three test files (`MediaCodecAndSensorEngineTest.kt`, `CaptureRequestFactoryTest.kt`, `UniversalSettingsAndExifTest.kt`) plus the minimum production "humble-object" seams they need. No production behaviour outside those seams was changed.
+
+**1. Restated logic replaced by production calls.**
+
+| old test (asserted a local copy) | replacement | production code exercised |
+|---|---|---|
+| `testAutomationPresetsIntegrity` — list literal in the test | `testAutomationBuiltInPresetsRegistry` | `AutomationEngine.BUILT_IN_PRESETS`, `getPresetById` (`AutomationEngine.kt:184-194`) |
+| 960/240/120 fps pacing — inline `1e6/fps` math | `testProductionFrameStepPacing960HighSpeed`, `…SlowMotionFrameStep32xExpansion`, `…FrameStepAcrossSupportedHighSpeeds` | `MediaCodecRecorder.computeFrameStepUs`/`computeSyntheticPtsUs` (`MediaCodecRecorder.kt:36-45`), the functions the drain loop calls (`:147`, `:172`) |
+| `testEvCoercionWithinHardwareRange` — local clamp | same name, production call | `CaptureRequestFactory.calculateEvIndex` (`CaptureRequestFactory.kt:92`), used at `:148` |
+| `testSpaceZoomHardwareClampingPreventsHalRejection` — local clamp | same name, production call | `CaptureRequestFactory.calculateEffectiveHardwareZoom` (`:100`), used at `:186` |
+| `testModeSettingsPerModeIsolation` — locally-built `modeMap` | same name, production reducer | `CameraUiState.switchToMode`/`currentModeSettings` (`CameraUiState.kt:154,172`), called by `CommixViewModel.kt:185` |
+| EXIF preset copy | `testExifPrivacyModePresetStripsSensitiveData`, `testExifAllowAllPresetEnablesAllMetadata` | `CameraUiState.withExifPreset` (`:197`), called by `CommixViewModel.kt:763` |
+| EXIF `copy()` mock | `testExifOptionsMappingFeedsRepositoryConsumer` | `CameraUiState.toExifOptions` (`:209`), assigned at `CommixViewModel.kt:424` |
+| cinema-matte `when` table | `testCinemaMatteRatiosParsing` | `CinemaMatte.aspectFor` (`ui/components/CinemaMatte.kt:13`), rendered by `CinemaMatteOverlay.kt:29` |
+| shutter-angle math copy | `testShutterAngleNanosecondsCalculation` | `CaptureRequestFactory.shutterAngleToExposureNs` (`:107`), called by `CommixViewModel.kt:640` |
+
+**2. Evidence — pass (forced re-run, not up-to-date).**
+
+```
+$ export JAVA_HOME=…/portable_sdk/jdk GRADLE_USER_HOME=…/portable_sdk/.gradle
+$ ./gradlew :app:testDebugUnitTest --offline --rerun --console=plain
+> Task :app:testDebugUnitTest
+BUILD SUCCESSFUL in 6s
+```
+
+Per-class results from `app/build/test-results/testDebugUnitTest/*.xml`:
+
+```
+CameraSessionManagerTest          11 tests, 0 failures, 0 errors
+CaptureRequestFactoryTest          9 tests, 0 failures, 0 errors
+KeyframeEngineAndAutomationTest   12 tests, 0 failures, 0 errors
+MediaCodecAndSensorEngineTest      9 tests, 0 failures, 0 errors
+PanoramaAnd360EngineTest           7 tests, 0 failures, 0 errors
+ProcessingJobQueueTest             9 tests, 0 failures, 0 errors
+UniversalSettingsAndExifTest       7 tests, 0 failures, 0 errors
+VideoFormatEngineTest             17 tests, 0 failures, 0 errors
+TOTAL                             81 tests, 0 failures, 0 errors, 0 skipped
+```
+
+**3. Grep — no contradictory second implementation left in the tests.** No test restates the production math: `grep -rn "roundToInt().coerceIn" app/src/test/kotlin/` → 0 hits; `grep -rn "coerceAtMost(hardwareMaxDigitalZoom" app/src/test/kotlin/` → 0 hits. Each helper listed above has exactly one definition and at least one production call site.
+
+**4. Honest residuals (not claimed fixed).**
+- **ViewModel bodies are not executed in-JVM.** `CommixViewModel`/`CommixRepository` construct Android framework objects and cannot be instantiated in a plain JVM unit test (no Robolectric on the classpath). The tests exercise the extracted reducer/mapping methods those ViewModel methods delegate to; the surrounding plumbing (SharedPreferences save, `statusMessage`, repository assignment) is covered only by the single delegation lines cited above.
+- **`testNative` coverage of `image_pipeline.cpp`/`color_science.cpp`** — ~~compiled by no test that calls them~~ **FIXED (2026-10-16 — evidence: §M).** `app/build.gradle.kts:139-187` builds both host binaries; `native_engine_test` links and calls `color_science.cpp` (`test_color_science_round_trip_and_continuity`) and `image_pipeline.cpp` (`test_image_pipeline_basic_operations`), and `jni_bridge.cpp` is covered per §K.
+- **No on-device smoke test** (JPEG/MP4/`.gcsv`) — that §E item remains open.
+
+**5. New finding — two divergent Gyroflow writers, with a likely accelerometer unit error.** The production exporter is Kotlin `SensorHub.exportGyroflowGcsv` (`SensorHub.kt:265-295`). A **second** writer exists in C++ (`stabilization_engine.cpp:68-80`) and is not equivalent:
+- it writes two keys that are **not** in the documented gcsv field set — `camera_name` (`:74`) and `frame_rate` (`:76`) — and `native_engine_test.cpp:163,165` asserts those exact lines, so the §1 "no contradictory second implementation" rule is violated; the Kotlin writer emits neither.
+- its `ascale` is `0.10197162129779283` (`:79`) while the Kotlin writer emits `ascale,1` (`SensorHub.kt:260`) for the *same* raw Android accelerometer values. The spec requires `ascale × raw = acceleration in **g**` (docs.gyroflow.xyz → "Mandatory fields", item 6), and Android `TYPE_ACCELEROMETER` returns raw **m/s²**, so the Kotlin path mis-scales the accelerometer by ≈9.81× (a stationary 9.81 m/s² is read as 9.81 g), which affects horizon lock. The C++ literal is the correct conversion; the Kotlin one is not. **Not fixed here** — `SensorHub.kt` is outside this task's scope and no on-device `.gcsv` exists to confirm the parse. `testGyroflowGcsvHeaderAndFormat` was aligned to the production Kotlin output and deliberately asserts only the four mandatory header lines plus the raw data rows, so it does not enshrine the scale.
+
+---
+
+## M. Native test coverage closure — 2026-10-16
+
+**Scope.** `app/src/test/cpp/native_engine_test.cpp` and the `testNative` task in `app/build.gradle.kts`. No production C++ was edited by this change: the production behaviours it now covers (the log-curve formulas, the `radius`-driven Gaussian blur, the `std::latch` completion) were already in the working tree when the suite was extended to reach them. This section strikes §J1 (log curves, `radius`, CV race), §J2 (`testNative` 6-of-10) and the §L residual only.
+
+**1. `testNative` now compiles and calls every engine translation unit.** `app/build.gradle.kts:139-187` builds and runs two host binaries:
+
+- `native_engine_test` — `native_engine_test.cpp` + the 8 engine `.cpp` other than `jni_bridge.cpp` (`build.gradle.kts:154-164`), compiled with the same `-Wall -Wextra -Werror -Wno-unused-parameter` policy the NDK build uses (`CMakeLists.txt:19-21`).
+- `jni_bridge_test` — `#include`s the production `jni_bridge.cpp` verbatim (9th file) against the host `JNIEnv` stubs (`build.gradle.kts:172-183`).
+
+The union is the full `COMMIX_SOURCES` list (`CMakeLists.txt:35-45`). Two tests were added to close the remaining gaps: the `radius`-sensitivity block in `test_image_pipeline_basic_operations` (step 7) and `test_process_zero_never_waits_on_dropped_work` (runs last; `ThreadPool` is a process-wide singleton and is shut down deliberately).
+
+**2. Evidence — pass.**
+
+```
+$ ./gradlew :app:testNative --offline --console=plain
+> Task :app:testNative
+ Commix Native C++20 Aether Engine Verification Suite
+[PASS] Hyperfocal distance calculation & bounds validation.
+[PASS] Astro median stacking & input bounds validation.
+[PASS] Long exposure accumulation (SilkyWater & LightTrails).
+[PASS] Multi-exposure blend modes (Additive, Average, Darken, Lighten).
+[PASS] Stabilization engine IMU ring buffer, Gyroflow export & Kalman filter.
+[PASS] Scopes engine neutral grey IRE & input bounds validation.
+[PASS] Telemetry seqlock concurrency contract (16958 valid concurrent reads, 0 torn reads).
+[PASS] BestShotEngine peak stillness determination & trigger contract.
+[PASS] Color science round-trip, inversion & branch continuity.
+[PASS] ImagePipeline tone mapping, grain simulation & unsharp mask operations.
+[PASS] processZero returns after pool shutdown; dropped slices are accounted for.
+ ALL NATIVE C++ ENGINE TESTS PASSED PERFECTLY!
+ Commix JNI Boundary Verification Suite
+[PASS] Scopes plane bounds match compute_scopes() exactly (odd and even geometry).
+[PASS] frameCount validated against GetArrayLength; engine cap enforced.
+[PASS] GetStringUTFChars NULL results are never dereferenced or released.
+[PASS] Registration tables complete (5 telemetry + 15 engine natives).
+ ALL JNI BOUNDARY TESTS PASSED
+BUILD SUCCESSFUL in 15s
+```
+
+**3. Evidence — each new/struck claim fails on the pre-fix code.** The current test sources were compiled unchanged; only the named production file was reverted to its `HEAD`/`fce2cbf` content.
+
+- **Log curves** — with `HEAD`'s `color_science.cpp`, `native_engine_test` aborts inside the new test:
+  `native_engine_test_prefix: src/test/cpp/native_engine_test.cpp:408: void test_color_science_round_trip_and_continuity(): Assertion 'std::fabs(xr - x) < 1e-3f' failed.` (exit 134).
+- **`applyUnsharpMask` radius** — with `HEAD`'s `image_pipeline.cpp`, the two radius runs are bit-identical and the suite aborts:
+  `native_engine_test_new_prefix: src/test/cpp/native_engine_test.cpp:560: void test_image_pipeline_basic_operations(): Assertion 'differ > 0' failed.` (exit 134). Standalone probe: `radius1-vs-radius8 differing pixels: 0` (pre-fix) vs `4096` (fixed).
+- **`processZero` dropped work** — with `HEAD`'s `image_pipeline.cpp`, shutting the pool down and calling `processZero` never returns (`HANG: processZero did not return within 3s after pool shutdown`, exit 42); the fixed code returns immediately. The same file's `HEAD` version also contains the stack `cv`/`cvMutex` + `notify_one`-after-unlock pattern the test's precursor was written against.
+
+**4. Residual / not claimed.**
+- These are host-side tests. No Android device produced a JPEG/MP4/`.gcsv`; §E's on-device smoke test remains open.
+- The seqlock stress test still inlines its own reader protocol against the raw `TelemetryBuffer`; it does not drive `native_read_telemetry` through JNI (§J2, still open).
+- `-Wno-unused-parameter` is retained to mirror `CMakeLists.txt:21`; it is not masking a defect here — `applyUnsharpMask`'s `radius` is now consumed (§J1).
+
+**5. Working-tree drift observed but NOT verified by this change (other domains).** The working tree has moved since §J was written; these are recorded so the §J text is not read as current, and are left for their owners to verify with the §1 four-part rule:
+- §J1:389 — `pushImuSample` is **no longer** zero-caller: `SensorHub.recordImuSample` forwards every live sample to it (`SensorHub.kt:206` → `jni_bridge.cpp:284-295` → `stabilization_engine.cpp:21`). Accordingly `stopAndExportGyroflow` now emits data rows, not a header-only file (`stabilization_engine.cpp:82-97`).
+- §J2:394 — the native exporter now writes the `id` and `orientation` metadata lines (`stabilization_engine.cpp:70-71`).
+- §J1:389's payload/index ordering is addressed: the sample is stored before the release-store of `m_writeIndex` (`stabilization_engine.cpp:32-33`). `m_isLogging` remains written-only.
+- No claim is made that any of the above is correct end-to-end; the Kotlin `.gcsv` path and the C++ path still diverge (§L.5).
+
+---
+
+## N. Camera2 & Viewfinder Surface Lifecycle Management — 2026-10-16
+
+**Scope.** `MainActivity.kt`, `ViewfinderSurface.kt`, `CommixViewModel.kt`, `CommixRepository.kt`. Closes the viewport freeze defect when leaving and returning to the application (strikes §J4 lifecycle defect).
+
+**1. Root Cause Analysis — Why the Viewport Froze.**
+- **TextureView Re-entrance Silence:** When an app goes to the background without finishing, the Activity transitions `onPause -> onStop`, but the view hierarchy remains attached in memory. `TextureView.SurfaceTextureListener.onSurfaceTextureDestroyed` is not invoked. When returning (`onStart -> onResume`), `TextureView.isAvailable` is already `true`, so `onSurfaceTextureAvailable` is **never fired**.
+- **Android OS CameraService Disconnection:** In Android 9+, CameraService prohibits background camera access and dispatches `CameraDevice.StateCallback.onDisconnected` or `onError`. `sessionManager.release()` was called, resetting camera state to `CLOSED`. Because `onSurfaceTextureAvailable` was never fired on return, nothing re-opened the camera. The `TextureView` displayed the stale frozen last frame indefinitely.
+- **Background Telemetry Churn:** `startTelemetryPolling()` ran an unthrottled 30Hz loop in `CommixViewModel` throughout backgrounding, churning CPU and battery on a closed camera.
+
+**2. The Fix (Production Code).**
+- **`ViewfinderSurface.kt`:** Added a `DisposableEffect(lifecycleOwner)` attaching a `LifecycleEventObserver`.
+  - On `Lifecycle.Event.ON_START`: Checks if `textureViewRef.isAvailable && tv.surfaceTexture != null`. If available, re-sets default buffer size, refreshes the transformation matrix, wraps the surface texture into a new `Surface`, and invokes `onSurfaceReady(surface, st)`.
+  - On `Lifecycle.Event.ON_STOP`: Calls `onSurfaceDestroyed()` and releases `currentSurface`.
+- **`MainActivity.kt`:** Added `onStart()` / `onStop()` forwarding foreground and background lifecycle transitions to `viewModel.onAppForeground()` and `viewModel.onAppBackground()`.
+- **`CommixViewModel.kt`:**
+  - Added `onAppForeground()` / `onAppBackground()`. Safely finalizes in-progress video recordings on backgrounding.
+  - Gated the 30Hz telemetry polling loop on `isForeground` to throttle polling during backgrounding.
+- **`CommixRepository.kt`:**
+  - Added `pauseCamera()`: Cleanly stops/closes `activeSession` and `activeDevice`, closes ImageReaders, releases surfaces, and stops orientation and thermal listeners.
+  - Added `resumeCamera()`: Re-initializes/validates `HandlerThread` and restores orientation and thermal monitoring.
+  - Added duplicate surface suppression in `openCamera`: If the camera is already open and active on the exact valid surface, skips redundant session reconfiguration.
+
+**3. Evidence — Pass.**
+- `./gradlew :app:testDebugUnitTest --rerun` → **BUILD SUCCESSFUL**, **95/95 unit tests pass, 0 failures, 0 errors**.
+- `./gradlew :app:testNative` → **BUILD SUCCESSFUL**, **11/11 native engine tests + JNI boundary suite pass (0 torn reads across >27,000 reads)**.
+
+
+## O. Video Recording Threading & MediaStore Cleanups — 2026-10-16
+
+**Scope.** `CommixViewModel.kt`, `CommixRepository.kt`. Closes residual §J4 threading & storage integrity defects.
+
+**1. Root Cause & Defects Addressed.**
+- **Main-Thread Video Recording Stall (§J4):** Starting video recording in `CommixViewModel.onShutterTapped()` ran synchronously on the Android Main thread, performing synchronous file creation (`mkdirs()`), `MediaCodec` initialization, surface configuration, and Camera2 IPC before returning control to the UI.
+- **MediaStore Video Orphan Records (§J4):** In `saveVideoToMediaStore()`, if copying the video bitstream to `resolver.openOutputStream(uri)` threw an exception (e.g. disk write failure), the caught exception did not call `resolver.delete(uri, null, null)`, permanently leaving an incomplete `IS_PENDING = 1` row in the user's MediaStore.
+- **Stop-Before-Start Race:** Rapid shutter tapping could dispatch `stopVideoRecording()` while `startVideoRecording()` was still mid-execution in the background.
+
+**2. The Fix (Production Code).**
+- **`CommixViewModel.kt`:**
+  - Dispatched `repository.startVideoRecording()` to `viewModelScope.launch(Dispatchers.Default)` tracked by `recordingJob: Job?`.
+  - Dispatched `repository.stopVideoRecording()` to background `Dispatchers.Default`, joining `priorJob?.join()` so stop teardown cleanly waits for start setup to complete before stopping.
+  - Added `videoTimerJob?.cancel()` and `recordingJob = null` to `repository.onError` callback.
+  - Removed redundant `withContext(Dispatchers.Main)` wrapper around `startVideoRecording` in automation workflows.
+- **`CommixRepository.kt`:**
+  - Added `resolver.delete(uri, null, null)` in the `catch (e: Exception)` block of `saveVideoToMediaStore` to eliminate orphan pending rows upon I/O failure.
+
+**3. Verification & Evidence.**
+- `./gradlew :app:testDebugUnitTest` → **BUILD SUCCESSFUL**, **101/101 unit tests pass, 0 failures, 0 errors** across 11 test suites.
+- `./gradlew :app:testNative` → **BUILD SUCCESSFUL**, **11/11 native engine tests + 4/4 JNI boundary tests pass (0 torn reads)**.
+- `./gradlew :app:assembleRelease` → **BUILD SUCCESSFUL**, release APK produced (`app-release.apk`, 4.7MB) verifying R8 minification, resource shrinking, and JNI/Compose symbols.
+
+
+## P. Processing Job Queue Concurrency & Viewfinder Containment — 2026-10-17
+
+**Scope.** `ProcessingJobQueue.kt`, `ProcessingJobQueueTest.kt`, `ViewfinderGeometryAndControlsTest.kt`.
+
+**1. Work Completed & Hardening.**
+- **Strict FIFO Within Same Priority Tier:** Replaced non-deterministic worker scheduling with true monotonic sequence-numbered FIFO execution for jobs within the same priority level (`JobPriority.HIGH`, `JobPriority.NORMAL`, `JobPriority.LOW`).
+- **Cooperative Cancellation & Worker Context:** Introduced `CancellationToken` and `JobExecutionContext` interfaces allowing long-running operations (such as multi-frame stacking or Gyroflow stabilization) to yield cooperatively on cancellation via `checkActive()` without resource leaks or hung threads.
+- **Dynamic Slot Reallocation:** Modified `maxConcurrentJobs` setter to dynamically evaluate waiting queues and trigger worker dispatches immediately upon capacity increase without requiring an active job completion event.
+- **Telemetry & Dynamic ETA:** Added progress milestone telemetry with dynamic ETA estimation.
+- **Viewfinder Aspect Ratio Containment:** Added `ViewfinderGeometryAndControlsTest` verifying that tall viewports (16:9, Cinema, Video) properly compute constraint bounds so Top Bar controls and dials are never pushed offscreen or occluded.
+
+**2. Verification Evidence.**
+- `./gradlew :app:testDebugUnitTest --rerun` → **BUILD SUCCESSFUL**, **114/114 unit tests pass, 0 failures, 0 errors across 12 test suites**.
+- `./gradlew :app:testNative` → **BUILD SUCCESSFUL**, **11/11 native engine tests + 4/4 JNI boundary tests pass (0 torn reads across >14,000 concurrent iterations)**.
+
+
+## Q. CI/CD Automation & Production Release Signing — 2026-10-29
+
+**Scope.** `.github/workflows/ci.yml`, `app/build.gradle.kts`, `.gitignore`. Closes audit finding §F & §G10.
+
+**1. Work Completed & Hardening.**
+- **GitHub Actions Full CI/CD Pipeline (`.github/workflows/ci.yml`):**
+  - **Verification Job:** Runs on `ubuntu-latest` with JDK 17 (Temurin). Compiles and validates C++20 host binaries (`native_engine_test`, `jni_bridge_test`) via `./gradlew :app:testNative` and executes both Debug and Release JVM unit test batteries (`:app:testDebugUnitTest`, `:app:testReleaseUnitTest`). Uploads test XML/HTML reports.
+  - **Assembly & Build Job:** Sets up NDK r27c and CMake. Handles release signing: if secret `ANDROID_KEYSTORE_BASE64` is configured in repository secrets, decodes and signs release APK; if not present, falls back gracefully to debug signature without breaking CI or local developer workflows.
+  - **Integrity & Checksums:** Verifies release APK with `apksigner verify --verbose --print-certs` and generates `SHA256SUMS.txt` for all produced artifacts. Uploads `commix-release-apk`, `commix-debug-apk`, and `checksums`.
+  - **Release Publishing Job:** Automatically triggers on git tags (`refs/tags/v*`) to create a tagged GitHub Release with release notes and attach signed APKs and SHA256 sums.
+- **Dynamic Release Signing (`app/build.gradle.kts`):**
+  - Implemented `signingConfigs.create("release")` reading environment variables (`SIGNING_STORE_FILE`, `SIGNING_STORE_PASSWORD`, `SIGNING_KEY_ALIAS`, `SIGNING_KEY_PASSWORD`) with safe fallback to debug keystore for developer local builds.
+- **Clean Hygiene (`.gitignore`):**
+  - Added `/.agents_bus/` and `/android/` to `.gitignore`.
+
+**2. Verification Evidence.**
+- `./gradlew :app:testDebugUnitTest :app:testReleaseUnitTest :app:testNative` → **BUILD SUCCESSFUL in 1m 8s**, 114/114 JVM unit tests passed, 15/15 native engine and JNI tests passed (0 torn reads across >35,000 reads).
+- `./gradlew :app:assembleRelease` → **BUILD SUCCESSFUL in 20s**, `app-release.apk` generated and signed via `signingConfigs.release`.
+

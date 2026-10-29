@@ -1,7 +1,8 @@
 package com.txor.commix
 
-import android.graphics.Rect
-import kotlin.math.roundToInt
+import android.hardware.camera2.CaptureRequest
+import com.txor.commix.model.CameraUiState
+import com.txor.commix.model.ModeSettings
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -70,47 +71,47 @@ class CaptureRequestFactoryTest {
 
     @Test
     fun testEvCoercionWithinHardwareRange() {
+        // Exercise the production EV-index helper that applyControls uses for CONTROL_AE_EXPOSURE_COMPENSATION.
         val evStep = 0.1f
         val minEvIndex = -12
         val maxEvIndex = 12
 
-        val highEv = 2.0f
-        val clampedHigh = (highEv / evStep).roundToInt().coerceIn(minEvIndex, maxEvIndex)
-        assertEquals(12, clampedHigh)
-
-        val lowEv = -2.5f
-        val clampedLow = (lowEv / evStep).roundToInt().coerceIn(minEvIndex, maxEvIndex)
-        assertEquals(-12, clampedLow)
+        assertEquals(12, CaptureRequestFactory.calculateEvIndex(2.0f, evStep, minEvIndex, maxEvIndex))
+        assertEquals(-12, CaptureRequestFactory.calculateEvIndex(-2.5f, evStep, minEvIndex, maxEvIndex))
+        assertEquals(0, CaptureRequestFactory.calculateEvIndex(0.0f, evStep, minEvIndex, maxEvIndex))
+        // In-range values are rounded to the nearest step index rather than clamped.
+        assertEquals(3, CaptureRequestFactory.calculateEvIndex(0.34f, evStep, minEvIndex, maxEvIndex))
+        assertEquals(-7, CaptureRequestFactory.calculateEvIndex(-0.7f, evStep, minEvIndex, maxEvIndex))
+        // A narrower hardware range must still clamp.
+        assertEquals(2, CaptureRequestFactory.calculateEvIndex(5.0f, 1.0f, -2, 2))
     }
 
     @Test
     fun testSpaceZoomHardwareClampingPreventsHalRejection() {
         val hardwareMaxZoom = 10.0
 
-        // User requests 30.0x Space Zoom (Super-resolution mode)
-        val requestedZoom30 = 30.0
-        val effectiveHwZoom30 = requestedZoom30.coerceAtMost(hardwareMaxZoom)
+        // Exercise the production clamp that applyControls applies before CONTROL_ZOOM_RATIO / SCALER_CROP_REGION.
+        val effectiveHwZoom30 = CaptureRequestFactory.calculateEffectiveHardwareZoom(30.0, hardwareMaxZoom)
         assertEquals(10.0, effectiveHwZoom30, 0.001)
-
         val crop30 = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, effectiveHwZoom30)
         assertEquals(400, crop30.width)
         assertEquals(300, crop30.height)
 
-        // User requests 100.0x Space Zoom Lock
-        val requestedZoom100 = 100.0
-        val effectiveHwZoom100 = requestedZoom100.coerceAtMost(hardwareMaxZoom)
+        val effectiveHwZoom100 = CaptureRequestFactory.calculateEffectiveHardwareZoom(100.0, hardwareMaxZoom)
         assertEquals(10.0, effectiveHwZoom100, 0.001)
-
         val crop100 = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, effectiveHwZoom100)
         assertEquals(400, crop100.width)
         assertEquals(300, crop100.height)
 
         // For standard 2.0x zoom, hardware zoom is not clamped
-        val effectiveHwZoom2 = 2.0.coerceAtMost(hardwareMaxZoom)
+        val effectiveHwZoom2 = CaptureRequestFactory.calculateEffectiveHardwareZoom(2.0, hardwareMaxZoom)
         assertEquals(2.0, effectiveHwZoom2, 0.001)
         val crop2 = CaptureRequestFactory.calculateCrop(0, 0, 4000, 3000, effectiveHwZoom2)
         assertEquals(2000, crop2.width)
         assertEquals(1500, crop2.height)
+
+        // A degenerate hardware maximum is floored to 1x instead of producing a sub-1x request.
+        assertEquals(1.0, CaptureRequestFactory.calculateEffectiveHardwareZoom(5.0, 0.0), 0.001)
     }
 
     @Test
@@ -128,54 +129,102 @@ class CaptureRequestFactoryTest {
     }
 
     @Test
-    fun testModeSettingsPerModeIsolation() {
-        val photoSettings = com.txor.commix.model.ModeSettings(
-            iso = 0,
-            shutterNs = 0L,
-            evStops = 0.0f,
-            wbKelvin = 0,
-            focusDiopters = -1.0f,
-            zoomRatio = 1.0,
-            toneCurve = "standard"
+    fun testAntibandingAutoSupportedWhenAvailable() {
+        val availableModes = intArrayOf(
+            CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_OFF,
+            CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_50HZ,
+            CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_60HZ,
+            CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO
         )
+        assertTrue(CaptureRequestFactory.isAntibandingAutoSupported(availableModes))
 
-        val proSettings = com.txor.commix.model.ModeSettings(
+        val paramsWithAuto = CaptureRequestParams(availableAntibandingModes = availableModes)
+        assertTrue(paramsWithAuto.isAntibandingAutoSupported)
+    }
+
+    @Test
+    fun testAntibandingAutoUnsupportedWhenOmittedFromHardware() {
+        val legacyModes = intArrayOf(
+            CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_OFF,
+            CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_50HZ,
+            CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_60HZ
+        )
+        assertFalse(CaptureRequestFactory.isAntibandingAutoSupported(legacyModes))
+
+        val paramsWithoutAuto = CaptureRequestParams(availableAntibandingModes = legacyModes)
+        assertFalse(paramsWithoutAuto.isAntibandingAutoSupported)
+
+        val emptyModes = intArrayOf()
+        assertFalse(CaptureRequestFactory.isAntibandingAutoSupported(emptyModes))
+    }
+
+    @Test
+    fun testAntibandingAutoDefaultsToSupportedWhenUnqueried() {
+        // When hardware characteristics have not specified modes (null), default to supported
+        assertTrue(CaptureRequestFactory.isAntibandingAutoSupported(null))
+
+        val defaultParams = CaptureRequestParams()
+        assertNull(defaultParams.availableAntibandingModes)
+        assertTrue(defaultParams.isAntibandingAutoSupported)
+    }
+
+    @Test
+    fun testModeSettingsPerModeIsolation() {
+        // Exercise the production reducer CameraUiState.switchToMode, which
+        // CommixViewModel.onModeSelected delegates to. No locally-built map.
+        val proSettings = ModeSettings(
             iso = 400,
             shutterNs = 20_000_000L, // 1/50s
             evStops = -0.7f,
             wbKelvin = 5600,
             focusDiopters = 2.5f,
             zoomRatio = 2.0,
-            toneCurve = "log"
+            toneCurve = "log",
+            showProControls = true
         )
 
-        val videoSettings = com.txor.commix.model.ModeSettings(
-            iso = 100,
-            shutterNs = 16_666_667L, // 1/60s (180-degree rule)
-            evStops = 0.0f,
-            wbKelvin = 4300,
-            focusDiopters = -1.0f,
+        // Start in PHOTO with its own values; PRO was visited earlier and seeded.
+        val photoState = CameraUiState(
+            activeMode = "PHOTO",
+            iso = 0,
+            shutterNs = 0L,
+            toneCurve = "standard",
             zoomRatio = 1.0,
-            toneCurve = "neutral"
+            perModeSettings = mapOf("PRO" to proSettings)
         )
 
-        val modeMap = mutableMapOf(
-            "PHOTO" to photoSettings,
-            "PRO" to proSettings,
-            "VIDEO" to videoSettings
-        )
+        // Switch to PRO: the seeded PRO settings are restored, not the PHOTO values.
+        val proState = photoState.switchToMode("PRO")
+        assertEquals("PRO", proState.activeMode)
+        assertEquals(400, proState.iso)
+        assertEquals(20_000_000L, proState.shutterNs)
+        assertEquals(-0.7f, proState.evStops, 0.001f)
+        assertEquals(5600, proState.wbKelvin)
+        assertEquals("log", proState.toneCurve)
+        assertEquals(2.0, proState.zoomRatio, 0.001)
+        assertTrue(proState.showProControls)
 
-        // Verify isolation
-        assertEquals(0, modeMap["PHOTO"]?.iso)
-        assertEquals(400, modeMap["PRO"]?.iso)
-        assertEquals(100, modeMap["VIDEO"]?.iso)
+        // PHOTO's outgoing settings were captured into the per-mode map.
+        assertEquals(0, proState.perModeSettings["PHOTO"]?.iso)
+        assertEquals("standard", proState.perModeSettings["PHOTO"]?.toneCurve)
 
-        assertEquals("standard", modeMap["PHOTO"]?.toneCurve)
-        assertEquals("log", modeMap["PRO"]?.toneCurve)
-        assertEquals("neutral", modeMap["VIDEO"]?.toneCurve)
+        // Switch back to PHOTO: its original values are restored and PRO stays intact.
+        val backToPhoto = proState.switchToMode("PHOTO")
+        assertEquals("PHOTO", backToPhoto.activeMode)
+        assertEquals(0, backToPhoto.iso)
+        assertEquals("standard", backToPhoto.toneCurve)
+        assertEquals(1.0, backToPhoto.zoomRatio, 0.001)
+        assertFalse(backToPhoto.showProControls)
+        assertEquals(400, backToPhoto.perModeSettings["PRO"]?.iso)
 
-        assertEquals(1.0, modeMap["PHOTO"]?.zoomRatio ?: 0.0, 0.001)
-        assertEquals(2.0, modeMap["PRO"]?.zoomRatio ?: 0.0, 0.001)
+        // A never-visited mode yields production defaults.
+        val freshVideo = backToPhoto.switchToMode("VIDEO")
+        assertEquals(0, freshVideo.iso)
+        assertEquals("neutral", freshVideo.toneCurve)
+        assertEquals(-1f, freshVideo.focusDiopters, 0.001f)
+        assertFalse(freshVideo.showProControls)
+
+        // Re-selecting the active mode is a no-op (returns the same instance).
+        assertSame(freshVideo, freshVideo.switchToMode("VIDEO"))
     }
 }
-

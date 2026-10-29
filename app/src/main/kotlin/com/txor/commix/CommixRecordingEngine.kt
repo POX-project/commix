@@ -9,7 +9,9 @@ import java.io.File
  * Commix Dedicated Recording Engine.
  *
  * Provides autonomous, non-standard frame rate pacing, high-speed burst frame synthesis,
- * high frame rate (HFR up to 960 FPS) container encoding, and butter-smooth slow-motion expansion.
+ * high frame rate (HFR up to 960 FPS) container encoding, 4K/8K resolution support,
+ * H.265 Main10 HDR10 profile negotiation, All-I / Long-GOP profile parameters,
+ * synchronized AAC audio encoding, and butter-smooth slow-motion expansion.
  * Decoupled from restrictive Android framework/HAL 30 FPS clamps.
  */
 class CommixRecordingEngine(
@@ -21,7 +23,13 @@ class CommixRecordingEngine(
     val isSlowMotion: Boolean = false,
     val playbackFps: Double = 30.0,
     val mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC,
-    val persistentSurface: Surface? = null
+    val persistentSurface: Surface? = null,
+    val isHdr10: Boolean = false,
+    val iFrameIntervalSeconds: Float = 1.0f,
+    val useSyntheticPts: Boolean = false,
+    val recordAudio: Boolean = false,
+    val audioSampleRate: Int = 44100,
+    val uncompressedAudio: Boolean = false
 ) {
     companion object {
         private const val TAG = "CommixRecordingEngine"
@@ -37,11 +45,20 @@ class CommixRecordingEngine(
         persistentSurface = persistentSurface,
         targetFps = targetFps,
         isSlowMotion = isSlowMotion,
-        playbackFps = playbackFps
+        playbackFps = playbackFps,
+        isHdr10 = isHdr10,
+        iFrameIntervalSeconds = iFrameIntervalSeconds,
+        useSyntheticPts = useSyntheticPts,
+        recordAudio = recordAudio,
+        audioSampleRate = audioSampleRate,
+        uncompressedAudio = uncompressedAudio
     )
 
     val surface: Surface?
         get() = recorder.surface
+
+    val audioFrameSink: AudioEngine.AudioFrameSink
+        get() = recorder.audioFrameSink
 
     @Volatile var isRunning: Boolean = false
         private set
@@ -56,7 +73,10 @@ class CommixRecordingEngine(
         if (isRunning) return
         Log.i(
             TAG,
-            "Starting Commix Recording Engine: ${width}x${height} @ ${targetFps} FPS (SlowMo=$isSlowMotion, Playback=${playbackFps} FPS, Dilation=${timeDilationFactor}x, Bitrate=${bitrateBps / 1_000_000} Mbps)"
+            "Starting Commix Recording Engine: ${width}x${height} @ ${targetFps} FPS " +
+            "(SlowMo=$isSlowMotion, Playback=${playbackFps} FPS, Dilation=${timeDilationFactor}x, " +
+            "Bitrate=${bitrateBps / 1_000_000} Mbps, HDR10=$isHdr10, All-I=${MediaCodecRecorder.isAllIProfile(iFrameIntervalSeconds)}, " +
+            "Audio=$recordAudio, Uncompressed=$uncompressedAudio)"
         )
         recorder.start()
         isRunning = true

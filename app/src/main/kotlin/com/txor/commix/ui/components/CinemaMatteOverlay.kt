@@ -26,15 +26,7 @@ fun CinemaMatteOverlay(
 ) {
     if (ratio == "off") return
 
-    val targetAspect = when (ratio) {
-        "2.39:1" -> 2.39f
-        "2.00:1" -> 2.00f
-        "1.85:1" -> 1.85f
-        "1.66:1" -> 1.66f
-        "16:9" -> 16f / 9f
-        "4:3" -> 4f / 3f
-        else -> 2.39f
-    }
+    val targetAspect = CinemaMatte.aspectFor(ratio)
 
     BoxWithConstraints(
         modifier = modifier.fillMaxSize()

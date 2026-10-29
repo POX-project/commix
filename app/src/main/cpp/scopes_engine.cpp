@@ -59,8 +59,8 @@ void compute_scopes(
     const int sx0 = width * 45 / 100, sx1 = width * 55 / 100;
     const int sy0 = height * 45 / 100, sy1 = height * 55 / 100;
 
-    const int uvW = (width + 1) / 2;
-    const int uvH = (height + 1) / 2;
+    const int uvW = chroma_width_for(width);
+    const int uvH = chroma_height_for(height);
 
     long totalPixels = 0;
     long hiClipCount = 0;
@@ -68,14 +68,16 @@ void compute_scopes(
 
     for (int yy = 0; yy < height; yy += step) {
         const uint8_t* yRow = y + static_cast<size_t>(yy) * yStride;
-        const int uvRow = (yy / 2 >= uvH) ? uvH - 1 : yy / 2;
+        // Clamp UV row index to [0, uvH-1] using explicit min for bounds safety
+        const int uvRow = std::min(std::max(yy / 2, 0), uvH - 1);
         const uint8_t* uRow = u + static_cast<size_t>(uvRow) * uvStride;
         const uint8_t* vRow = v + static_cast<size_t>(uvRow) * uvStride;
         const int parRow = (yy * PARADE_N / height >= PARADE_N) ? PARADE_N - 1 : yy * PARADE_N / height;
 
         for (int xx = 0; xx < width; xx += step) {
             const int yi = yRow[xx];
-            const int uvx = (xx / 2 >= uvW) ? uvW - 1 : xx / 2;
+            // Clamp UV column index to [0, uvW-1] using explicit min for bounds safety
+            const int uvx = std::min(std::max(xx / 2, 0), uvW - 1);
             const int ui = uRow[static_cast<size_t>(uvx) * uvPixelStride] - 128;
             const int vi = vRow[static_cast<size_t>(uvx) * uvPixelStride] - 128;
 
@@ -113,8 +115,9 @@ void compute_scopes(
             nChroma++;
 
             if ((xx % vscopeStride == 0) && (yy % vscopeStride == 0) && vscopeCount < VSCOPE_SAMPLES) {
-                out.vscope[vscopeCount * 2] = static_cast<float>(vi / 128.0);
-                out.vscope[vscopeCount * 2 + 1] = static_cast<float>(ui / 128.0);
+                // Vectorscope standard: X-axis represents B-Y (U), Y-axis represents R-Y (V)
+                out.vscope[vscopeCount * 2] = static_cast<float>(ui / 128.0);
+                out.vscope[vscopeCount * 2 + 1] = static_cast<float>(vi / 128.0);
                 vscopeCount++;
             }
 

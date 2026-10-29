@@ -40,13 +40,14 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     template <typename F>
-    void enqueue(F&& f) {
+    bool enqueue(F&& f) {
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            if (m_stop.load(std::memory_order_relaxed)) return;
+            if (m_stop.load(std::memory_order_relaxed)) return false;
             m_tasks.emplace(std::forward<F>(f));
         }
         m_cv.notify_one();
+        return true;
     }
 
     void shutdown() noexcept {

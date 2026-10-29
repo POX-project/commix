@@ -31,6 +31,14 @@ struct StarCentroid {
  */
 class ComputationalPhotoEngine {
 public:
+    /**
+     * Hard ceiling on the frames stackAstroFrames() will median-filter. Beyond
+     * this the extra frames are silently discarded, so callers that care about
+     * their frame count (the JNI boundary) must reject an over-long request
+     * rather than let the engine drop it.
+     */
+    static constexpr int MAX_STACK_FRAMES = 16;
+
     // 1. Astrophotography: Star centroid alignment and median noise stacking
     static bool stackAstroFrames(
         const uint8_t* const* framePointers,

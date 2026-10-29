@@ -2,8 +2,11 @@ package com.txor.commix
 
 import android.graphics.Rect
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.ColorSpaceTransform
+import android.hardware.camera2.params.RggbChannelVector
 import android.os.Build
 import android.util.Range
+import android.util.Rational
 import kotlin.math.roundToInt
 
 /**
@@ -37,16 +40,29 @@ data class CaptureRequestParams(
     val videoCodec: String = "hevc",
     val nightFrameCount: Int = 8,
     val nightAstroAlignment: Boolean = false,
+    val nightTone: String = "neutral",
     val timeLapseIntervalSec: Int = 2,
     val uncompressedAudio: Boolean = false,
+    val audioLowCut: Boolean = false,
+    val audioGain: Float = 0.0f,
+    val adaptivePerformanceEnabled: Boolean = true,
     val cinemaMatteRatio: String = "off",
     val photoFormat: String = "jpeg",
+    val photoQuality: Int = 95,
     val photoEnhanceAlgo: String = "clarity",
     val aebEnabled: Boolean = false,
     val aebShots: Int = 3,
     val aebSpreadEv: Float = 1.0f,
-    val anamorphicRatio: Float = 1.0f
-)
+    val anamorphicRatio: Float = 1.0f,
+    val sensitivityRange: IntRange? = null,
+    val exposureTimeRangeNs: LongRange? = null,
+    val lastAutoIso: Int = 0,
+    val lastAutoExposureTimeNs: Long = 0L,
+    val availableAntibandingModes: IntArray? = null
+) {
+    val isManualExposureRequested: Boolean get() = iso > 0 || expNs > 0L
+    val isAntibandingAutoSupported: Boolean get() = CaptureRequestFactory.isAntibandingAutoSupported(availableAntibandingModes)
+}
 
 
 /**
@@ -86,10 +102,142 @@ object CaptureRequestFactory {
     }
 
     /**
+     * Maps exposure compensation in stops onto the HAL's integer EV index, clamped to the
+     * reported [minEvIndex]..[maxEvIndex] hardware range.
+     */
+    fun calculateEvIndex(evStops: Float, evStep: Float, minEvIndex: Int, maxEvIndex: Int): Int {
+        return (evStops / evStep).roundToInt().coerceIn(minEvIndex, maxEvIndex)
+    }
+
+    /**
+     * Clamps a requested zoom ratio to the sensor's reported maximum digital zoom, preventing
+     * HAL rejection of out-of-range CONTROL_ZOOM_RATIO requests.
+     */
+    fun calculateEffectiveHardwareZoom(requestedZoom: Double, hardwareMaxDigitalZoom: Double): Double {
+        return requestedZoom.coerceAtMost(hardwareMaxDigitalZoom.coerceAtLeast(1.0))
+    }
+
+    /**
+     * Converts a cinema shutter angle (degrees) at [fps] into an exposure time in nanoseconds.
+     */
+    fun shutterAngleToExposureNs(angleDeg: Double, fps: Double): Long {
+        val safeFps = fps.coerceAtLeast(1.0)
+        return (1_000_000_000.0 * (angleDeg / 360.0) / safeFps).toLong()
+    }
+
+    enum class AeMode {
+        ON,
+        OFF,
+        UNSET
+    }
+
+    enum class ManualExposure { NONE, ISO_ONLY, SHUTTER_ONLY, ISO_AND_SHUTTER }
+
+    data class ExposurePlan(
+        val aeMode: AeMode,
+        val sensitivity: Int? = null,
+        val exposureTimeNs: Long? = null,
+        val frameDurationNs: Long? = null,
+        val evIndex: Int? = null,
+        val manual: ManualExposure = ManualExposure.NONE,
+        val warning: String? = null
+    )
+
+    private const val DEFAULT_AUTO_ISO = 100
+    private const val DEFAULT_AUTO_EXPOSURE_NS = 33_333_333L
+    private const val MIN_FRAME_DURATION_NS = 33_333_333L
+
+    // Standard 3x3 identity color space transform matrix for white balance
+    private val IDENTITY_COLOR_TRANSFORM = ColorSpaceTransform(
+        arrayOf(
+            Rational(1, 1), Rational(0, 1), Rational(0, 1),
+            Rational(0, 1), Rational(1, 1), Rational(0, 1),
+            Rational(0, 1), Rational(0, 1), Rational(1, 1)
+        )
+    )
+
+    /**
+     * Determines whether CONTROL_AE_ANTIBANDING_MODE_AUTO is supported.
+     * When [availableModes] is null, auto antibanding is assumed supported by default.
+     * When [availableModes] is provided, verifies that CONTROL_AE_ANTIBANDING_MODE_AUTO is present.
+     */
+    fun isAntibandingAutoSupported(availableModes: IntArray?): Boolean {
+        return availableModes == null || availableModes.contains(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)
+    }
+
+    fun resolveExposure(params: CaptureRequestParams): ExposurePlan {
+        if (params.flashMode == "torch" || params.flashMode == "on" || params.flashMode == "auto") {
+            return ExposurePlan(
+                aeMode = AeMode.UNSET,
+                sensitivity = null, exposureTimeNs = null, frameDurationNs = null, evIndex = null,
+                manual = ManualExposure.NONE,
+                warning = if (params.isManualExposureRequested)
+                    "Manual exposure overridden by flash mode '${params.flashMode}'"
+                else null
+            )
+        }
+
+        val isoManual = params.iso > 0
+        val shutterManual = params.expNs > 0L
+
+        if (!isoManual && !shutterManual) {
+            val evIndex = if (params.evRange != null && params.evStep > 0f) {
+                calculateEvIndex(params.evStops, params.evStep, params.evRange.lower, params.evRange.upper)
+            } else null
+            return ExposurePlan(AeMode.ON, null, null, null, evIndex, ManualExposure.NONE, null)
+        }
+
+        val isoRaw = if (isoManual) params.iso else fallbackIso(params)
+        val expRaw = if (shutterManual) params.expNs else fallbackExposureNs(params)
+        val iso = params.sensitivityRange?.let { isoRaw.coerceIn(it) } ?: isoRaw
+        val exp = params.exposureTimeRangeNs?.let { expRaw.coerceIn(it) } ?: expRaw
+
+        val manual = when {
+            isoManual && shutterManual -> ManualExposure.ISO_AND_SHUTTER
+            isoManual -> ManualExposure.ISO_ONLY
+            else -> ManualExposure.SHUTTER_ONLY
+        }
+        val warning = when {
+            iso != isoRaw && exp != expRaw -> "ISO $isoRaw and exposure ${expRaw}ns clamped to $iso / ${exp}ns"
+            iso != isoRaw -> "ISO $isoRaw clamped to $iso (sensor sensitivity range)"
+            exp != expRaw -> "Exposure ${expRaw}ns clamped to ${exp}ns (sensor exposure range)"
+            else -> null
+        }
+
+        return ExposurePlan(
+            aeMode = AeMode.OFF,
+            sensitivity = iso,
+            exposureTimeNs = exp,
+            frameDurationNs = maxOf(exp, MIN_FRAME_DURATION_NS),
+            evIndex = null,
+            manual = manual,
+            warning = warning
+        )
+    }
+
+    private fun fallbackIso(p: CaptureRequestParams): Int {
+        val v = if (p.lastAutoIso > 0) p.lastAutoIso else DEFAULT_AUTO_ISO
+        return p.sensitivityRange?.let { v.coerceIn(it) } ?: v
+    }
+
+    private fun fallbackExposureNs(p: CaptureRequestParams): Long {
+        val v = if (p.lastAutoExposureTimeNs > 0L) p.lastAutoExposureTimeNs else DEFAULT_AUTO_EXPOSURE_NS
+        return p.exposureTimeRangeNs?.let { v.coerceIn(it) } ?: v
+    }
+
+    /**
      * Applies all exposure, optical, stabilization, flash, and 3A controls to the target CaptureRequest.Builder.
      */
-    fun applyControls(builder: CaptureRequest.Builder, params: CaptureRequestParams) {
-        // --- 0. FLASH / TORCH MODE ---
+    fun applyControls(builder: CaptureRequest.Builder, params: CaptureRequestParams): ExposurePlan {
+        // --- 0. 3A BASELINE (CONTROL_MODE) & ANTIBANDING ---
+        try {
+            builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+            if (isAntibandingAutoSupported(params.availableAntibandingModes)) {
+                builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)
+            }
+        } catch (_: Throwable) {}
+
+        // --- FLASH / TORCH MODE ---
         try {
             when (params.flashMode) {
                 "torch" -> {
@@ -111,23 +259,22 @@ object CaptureRequestFactory {
         } catch (_: Throwable) {}
 
         // --- 1. EXPOSURE (ISO, Shutter, EV) ---
+        var plan = resolveExposure(params)
         try {
-            if (params.flashMode != "torch" && params.iso > 0 && params.expNs > 0L) {
-                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                builder.set(CaptureRequest.SENSOR_SENSITIVITY, params.iso)
-                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, params.expNs)
-                // Prevent ISP from clamping manual long exposures to 30fps
-                builder.set(CaptureRequest.SENSOR_FRAME_DURATION, params.expNs.coerceAtLeast(33_333_333L))
-            } else if (params.flashMode != "torch" && params.flashMode != "on" && params.flashMode != "auto") {
-                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                if (params.evRange != null && params.evStep > 0f) {
-                    val evIndex = (params.evStops / params.evStep).roundToInt().coerceIn(
-                        params.evRange.lower, params.evRange.upper
-                    )
-                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evIndex)
+            when (plan.aeMode) {
+                AeMode.ON -> builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                AeMode.OFF -> {
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                    plan.sensitivity?.let { builder.set(CaptureRequest.SENSOR_SENSITIVITY, it) }
+                    plan.exposureTimeNs?.let { builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, it) }
+                    plan.frameDurationNs?.let { builder.set(CaptureRequest.SENSOR_FRAME_DURATION, it) }
                 }
+                AeMode.UNSET -> {}
             }
-        } catch (_: Throwable) {}
+            plan.evIndex?.let { builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, it) }
+        } catch (e: Throwable) {
+            plan = plan.copy(warning = listOfNotNull(plan.warning, "HAL rejected exposure: ${e.message}").joinToString("; "))
+        }
 
         // --- 2. FOCUS (AF vs Manual) ---
         try {
@@ -148,8 +295,9 @@ object CaptureRequestFactory {
                 val gains = calculateRgbGains(params.wbKelvin)
                 builder.set(
                     CaptureRequest.COLOR_CORRECTION_GAINS,
-                    android.hardware.camera2.params.RggbChannelVector(gains[0], gains[1], gains[2], gains[3])
+                    RggbChannelVector(gains[0], gains[1], gains[2], gains[3])
                 )
+                builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, IDENTITY_COLOR_TRANSFORM)
                 builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
             } else {
                 builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
@@ -159,8 +307,7 @@ object CaptureRequestFactory {
 
         // --- 4. OPTICAL / DIGITAL ZOOM ---
         try {
-            val hwMax = params.hardwareMaxDigitalZoom.coerceAtLeast(1.0)
-            val effectiveHwZoom = params.zoom.coerceAtMost(hwMax)
+            val effectiveHwZoom = calculateEffectiveHardwareZoom(params.zoom, params.hardwareMaxDigitalZoom)
 
             if (Build.VERSION.SDK_INT >= 30 && params.zoomRatioRange != null) {
                 val z = effectiveHwZoom.toFloat().coerceIn(params.zoomRatioRange.lower, params.zoomRatioRange.upper)
@@ -203,6 +350,18 @@ object CaptureRequestFactory {
                 builder.set(CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_OFF)
             }
         } catch (_: Throwable) {}
+
+        // --- 7. STILL CAPTURE QUALITY & LOSSLESS MAX-OUT ---
+        try {
+            val quality = if (PhotoFormatEngine.isLossless(params.photoFormat, params.photoQuality)) {
+                100
+            } else {
+                params.photoQuality.coerceIn(1, 100)
+            }
+            builder.set(CaptureRequest.JPEG_QUALITY, quality.toByte())
+        } catch (_: Throwable) {}
+
+        return plan
     }
 
     /**

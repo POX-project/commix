@@ -140,86 +140,155 @@ object LensProbeService {
 
     fun buildCameraProbeResult(manager: CameraManager, id: String): CameraProbeResult? {
         val c = try { manager.getCameraCharacteristics(id) } catch (_: Exception) { return null }
+        val streamMap = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+        val stSizes = streamMap.getOutputSizes(android.graphics.SurfaceTexture::class.java)
+        if (stSizes.isNullOrEmpty()) {
+            // Cannot provide a preview stream to Viewfinder; skip non-camera hardware ID
+            return null
+        }
 
-            val facing = c.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
-            val isFront = (facing == CameraCharacteristics.LENS_FACING_FRONT)
-            val caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
-            val fls = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: FloatArray(0)
-            val sensorSize = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+        val isOfficialId = try { manager.cameraIdList.contains(id) } catch (_: Exception) { false }
+        val isBackwardCompatible = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE)
+        if (!isOfficialId && !isBackwardCompatible) {
+            // Skip non-standalone internal sensors (e.g. depth-only or restricted OEM sensors)
+            return null
+        }
 
-            // Dynamic 35mm equivalent focal length computation
-            // eq = focal_length * (diagonal_of_35mm_full_frame / diagonal_of_sensor)
-            // Full frame 36x24mm diagonal = sqrt(36^2 + 24^2) = 43.2666mm
-            var eq = 0f
-            if (sensorSize != null && fls.isNotEmpty()) {
-                val diag = sqrt(sensorSize.width * sensorSize.width + sensorSize.height * sensorSize.height)
-                eq = if (diag > 0f) fls[0] * (43.2666f / diag) else fls[0] * 5.0f
-            } else if (fls.isNotEmpty()) {
-                eq = fls[0] * 5.0f
-            }
-            val displayFocal = if (eq > 0f) eq.roundToInt().toFloat() else (if (fls.isNotEmpty()) fls[0] else 24f)
+        val facing = c.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
+        val isFront = (facing == CameraCharacteristics.LENS_FACING_FRONT)
+        val fls = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: FloatArray(0)
+        val sensorSize = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
 
-            val minFocus = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+        // Dynamic 35mm equivalent focal length computation
+        var eq = 0f
+        if (sensorSize != null && fls.isNotEmpty()) {
+            val diag = sqrt(sensorSize.width * sensorSize.width + sensorSize.height * sensorSize.height)
+            eq = if (diag > 0f) fls[0] * (43.2666f / diag) else fls[0] * 5.0f
+        } else if (fls.isNotEmpty()) {
+            eq = fls[0] * 5.0f
+        }
+        val displayFocal = if (eq > 0f) eq.roundToInt().toFloat() else (if (fls.isNotEmpty()) fls[0] else 24f)
 
-            // Dynamic optical lens classification - ZERO hardcoded camera IDs!
-            val isDepth = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT)
-            val isMacro = !isFront && !isDepth && (minFocus >= 20.0f || (minFocus >= 10.0f && (sensorSize != null && sensorSize.width < 3.2f)))
-            val isUltraWide = !isFront && !isDepth && !isMacro && (displayFocal < 24.0f)
-            val isTele = !isFront && !isDepth && !isMacro && !isUltraWide && (displayFocal >= 45.0f)
+        val minFocus = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
 
-            val hasOis = (c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: IntArray(0))
-                .contains(CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON)
-            val hasEis = (c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: IntArray(0))
-                .contains(CameraCharacteristics.CONTROL_VIDEO_STABILIZATION_MODE_ON)
-            val hasAf = minFocus > 0f
-            val hasRaw = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
-            val hasFlash = c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
+        // Dynamic optical lens classification - ZERO hardcoded camera IDs!
+        val isDepth = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT)
+        val classification = classifyLensOptics(
+            isFront = isFront,
+            isDepth = isDepth,
+            minFocusDiopters = minFocus,
+            displayFocal35mm = displayFocal,
+            sensorWidthMm = sensorSize?.width ?: 6.4f
+        )
+        val isMacro = classification.isMacro
+        val isUltraWide = classification.isUltraWide
+        val isTele = classification.isTelephoto
 
-            val sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-            val activeArray = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: Rect(0, 0, 0, 0)
-            val isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-            val expRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-            val evRange = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
-            val evStepRational = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
-            val evStep = if (evStepRational != null && evStepRational.denominator != 0) {
-                evStepRational.numerator.toFloat() / evStepRational.denominator.toFloat()
-            } else 0.1f
+        val hasOis = (c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: IntArray(0))
+            .contains(CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON)
+        val hasEis = (c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: IntArray(0))
+            .contains(CameraCharacteristics.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+        val hasAf = minFocus > 0f
+        val hasRaw = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
+        val hasFlash = c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
 
-            val maxDigitalZoom = (c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0).coerceAtLeast(1.0)
-            val zoomRatioRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
-            } else null
+        val sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val activeArray = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: Rect(0, 0, 0, 0)
+        val pixelArray = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+        val isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+        val expRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        val evRange = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        val evStepRational = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+        val evStep = if (evStepRational != null && evStepRational.denominator != 0) {
+            evStepRational.numerator.toFloat() / evStepRational.denominator.toFloat()
+        } else 0.1f
 
-            val allJpegSizes = mutableSetOf<Size>()
-            val streamMap = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            streamMap?.getOutputSizes(ImageFormat.JPEG)?.let { allJpegSizes.addAll(it) }
+        val maxDigitalZoom = (c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0).coerceAtLeast(1.0)
+        val zoomRatioRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        } else null
 
-            // High resolution outputs (API 23+)
+        val allJpegSizes = mutableSetOf<Size>()
+        streamMap.getOutputSizes(ImageFormat.JPEG)?.let { allJpegSizes.addAll(it) }
+
+        // High resolution outputs (API 23+)
+        try {
+            streamMap.getHighResolutionOutputSizes(ImageFormat.JPEG)?.let { allJpegSizes.addAll(it) }
+        } catch (_: Throwable) {}
+
+        // RAW and Quad-Bayer / remosaic sensor streams
+        try {
+            streamMap.getOutputSizes(ImageFormat.RAW_SENSOR)?.let { allJpegSizes.addAll(it) }
+            streamMap.getOutputSizes(ImageFormat.RAW10)?.let { allJpegSizes.addAll(it) }
+            streamMap.getHighResolutionOutputSizes(ImageFormat.RAW_SENSOR)?.let { allJpegSizes.addAll(it) }
+        } catch (_: Throwable) {}
+
+        // Android 12+ Maximum Resolution Configuration Map (API 31+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
-                streamMap?.getHighResolutionOutputSizes(ImageFormat.JPEG)?.let { allJpegSizes.addAll(it) }
+                val maxMap = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+                maxMap?.getOutputSizes(ImageFormat.JPEG)?.let { allJpegSizes.addAll(it) }
+                maxMap?.getOutputSizes(ImageFormat.RAW_SENSOR)?.let { allJpegSizes.addAll(it) }
             } catch (_: Throwable) {}
+            try {
+                val maxActive = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+                if (maxActive != null && maxActive.width() > 0 && maxActive.height() > 0) {
+                    allJpegSizes.add(Size(maxActive.width(), maxActive.height()))
+                }
+            } catch (_: Throwable) {}
+            try {
+                val maxPixel = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+                if (maxPixel != null && maxPixel.width > 0 && maxPixel.height > 0) {
+                    allJpegSizes.add(Size(maxPixel.width, maxPixel.height))
+                }
+            } catch (_: Throwable) {}
+        }
 
-            // Android 12+ Maximum Resolution Configuration Map (API 31+)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        // Hardware Active Array & Pixel Array Sizes (directly from sensor HAL3)
+        if (activeArray.width() > 0 && activeArray.height() > 0) {
+            allJpegSizes.add(Size(activeArray.width(), activeArray.height()))
+        }
+        if (pixelArray != null && pixelArray.width > 0 && pixelArray.height > 0) {
+            allJpegSizes.add(Size(pixelArray.width, pixelArray.height))
+        }
+
+        // Xiaomi & OEM Vendor Super-Resolution Stream Configurations
+        val superResKeys = listOf(
+            "com.xiaomi.scaler.availableSuperResolutionStreamConfigurations",
+            "xiaomi.scaler.availableSuperResolutionStreamConfigurations",
+            "com.xiaomi.scaler.availableStreamConfigurations",
+            "com.samsung.android.scaler.availableStreamConfigurations",
+            "com.mediatek.scaler.availableStreamConfigurations"
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            for (keyName in superResKeys) {
                 try {
-                    val maxMap = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
-                    maxMap?.getOutputSizes(ImageFormat.JPEG)?.let { allJpegSizes.addAll(it) }
+                    val key = CameraCharacteristics.Key<IntArray>(keyName, IntArray::class.java)
+                    val arr = c.get(key)
+                    if (arr != null) {
+                        var i = 0
+                        while (i + 3 < arr.size) {
+                            val fmt = arr[i]
+                            val w = arr[i + 1]
+                            val h = arr[i + 2]
+                            if (w > 0 && h > 0 && (fmt == 33 || fmt == 35 || fmt == 256 || fmt == 0x21 || fmt == 0x23)) {
+                                allJpegSizes.add(Size(w, h))
+                            }
+                            i += 4
+                        }
+                    }
                 } catch (_: Throwable) {}
             }
+        }
 
-            // Xiaomi & OEM Vendor Super-Resolution Stream Configurations
-            val superResKeys = listOf(
-                "com.xiaomi.scaler.availableSuperResolutionStreamConfigurations",
-                "xiaomi.scaler.availableSuperResolutionStreamConfigurations",
-                "com.xiaomi.scaler.availableStreamConfigurations",
-                "com.samsung.android.scaler.availableStreamConfigurations",
-                "com.mediatek.scaler.availableStreamConfigurations"
-            )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                for (keyName in superResKeys) {
+        // Dynamically scan all available characteristics keys for superresolution / remosaic configurations
+        try {
+            for (k in c.keys) {
+                val kname = k.name.lowercase()
+                if (kname.contains("superresolution") || kname.contains("remosaic")) {
                     try {
-                        val key = CameraCharacteristics.Key<IntArray>(keyName, IntArray::class.java)
-                        val arr = c.get(key)
+                        val arr = c.get(k) as? IntArray
                         if (arr != null) {
                             var i = 0
                             while (i + 3 < arr.size) {
@@ -235,46 +304,30 @@ object LensProbeService {
                     } catch (_: Throwable) {}
                 }
             }
+        } catch (_: Throwable) {}
 
-            // Dynamically scan all available characteristics keys for superresolution / remosaic configurations
-            try {
-                for (k in c.keys) {
-                    val kname = k.name.lowercase()
-                    if (kname.contains("superresolution") || kname.contains("remosaic")) {
-                        try {
-                            val arr = c.get(k) as? IntArray
-                            if (arr != null) {
-                                var i = 0
-                                while (i + 3 < arr.size) {
-                                    val fmt = arr[i]
-                                    val w = arr[i + 1]
-                                    val h = arr[i + 2]
-                                    if (w > 0 && h > 0 && (fmt == 33 || fmt == 35 || fmt == 256 || fmt == 0x21 || fmt == 0x23)) {
-                                        allJpegSizes.add(Size(w, h))
-                                    }
-                                    i += 4
-                                }
-                            }
-                        } catch (_: Throwable) {}
-                    }
-                }
-            } catch (_: Throwable) {}
+        val sortedSizes = allJpegSizes
+            .filter { it.width > 0 && it.height > 0 }
+            .distinctBy { it.width.toLong() * it.height.toLong() }
+            .sortedByDescending { it.width.toLong() * it.height.toLong() }
 
-            // Hardware device-aware fallback for ultra-high-resolution sensors where OEM HAL hides binned remosaic sizes
-            if (DeviceQuirksManager.isHelioG90T && facing == CameraCharacteristics.LENS_FACING_BACK && activeArray.width() >= 9000) {
-                allJpegSizes.add(Size(9248, 6936))
-            }
+        val hiResJpeg = sortedSizes.firstOrNull()
+            ?: Size(activeArray.width().coerceAtLeast(1920), activeArray.height().coerceAtLeast(1080))
 
-            val sortedSizes = allJpegSizes.sortedByDescending { it.width.toLong() * it.height.toLong() }
-            val hiResJpeg = sortedSizes.firstOrNull()
-                ?: Size(activeArray.width().coerceAtLeast(1920), activeArray.height().coerceAtLeast(1080))
+        val standardJpeg = sortedSizes.filter { it.width <= 1920 && it.height <= 1440 }
+            .firstOrNull() ?: hiResJpeg
 
-            val standardJpeg = sortedSizes.filter { it.width <= 1920 && it.height <= 1440 }
-                .firstOrNull() ?: hiResJpeg
+        val maxHardwarePixels = calculateMaxHardwarePixels(
+            activeW = activeArray.width().toLong(),
+            activeH = activeArray.height().toLong(),
+            pixelW = pixelArray?.width?.toLong() ?: 0L,
+            pixelH = pixelArray?.height?.toLong() ?: 0L,
+            hiResW = hiResJpeg.width.toLong(),
+            hiResH = hiResJpeg.height.toLong()
+        )
+        val sensorMp = computeSensorMegapixels(maxHardwarePixels)
 
-            val sensorMp = (hiResJpeg.width.toDouble() * hiResJpeg.height.toDouble()) / 1_000_000.0
-
-            val apertures = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES) ?: FloatArray(0)
+        val apertures = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES) ?: FloatArray(0)
 
         return CameraProbeResult(
             cameraId = id,
@@ -306,6 +359,48 @@ object LensProbeService {
             supportedJpegSizes = sortedSizes
         )
     }
+
+    fun computeSensorMegapixels(maxHardwarePixels: Long): Double {
+        return maxHardwarePixels.toDouble() / 1_000_000.0
+    }
+
+    fun calculateMaxHardwarePixels(
+        activeW: Long,
+        activeH: Long,
+        pixelW: Long = 0L,
+        pixelH: Long = 0L,
+        hiResW: Long = 0L,
+        hiResH: Long = 0L
+    ): Long {
+        return maxOf(
+            activeW * activeH,
+            pixelW * pixelH,
+            hiResW * hiResH
+        )
+    }
+
+    fun classifyLensOptics(
+        isFront: Boolean,
+        isDepth: Boolean,
+        minFocusDiopters: Float,
+        displayFocal35mm: Float,
+        sensorWidthMm: Float = 6.4f
+    ): LensClassification {
+        val isMacro = !isFront && !isDepth && (minFocusDiopters >= 20.0f || (minFocusDiopters >= 10.0f && sensorWidthMm < 3.2f))
+        val isUltraWide = !isFront && !isDepth && !isMacro && (displayFocal35mm < 24.0f)
+        val isTele = !isFront && !isDepth && !isMacro && !isUltraWide && (displayFocal35mm >= 45.0f)
+        val isWide = !isFront && !isDepth && !isMacro && !isUltraWide && !isTele
+        return LensClassification(isFront, isDepth, isMacro, isUltraWide, isTele, isWide)
+    }
+
+    data class LensClassification(
+        val isFront: Boolean,
+        val isDepth: Boolean,
+        val isMacro: Boolean,
+        val isUltraWide: Boolean,
+        val isTelephoto: Boolean,
+        val isWide: Boolean
+    )
 
     /**
      * Legacy Map adapter for backwards compatibility with any untyped consumers.

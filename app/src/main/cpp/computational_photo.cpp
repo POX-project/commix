@@ -24,8 +24,8 @@ bool ComputationalPhotoEngine::stackAstroFrames(
     }
 
     const size_t totalBytes = static_cast<size_t>(width) * height * channels;
-    const int maxFrames = std::min(frameCount, 16);
-    uint8_t pixelValues[16];
+    const int maxFrames = std::min(frameCount, MAX_STACK_FRAMES);
+    uint8_t pixelValues[MAX_STACK_FRAMES];
 
     for (size_t i = 0; i < totalBytes; ++i) {
         for (int f = 0; f < maxFrames; ++f) {
