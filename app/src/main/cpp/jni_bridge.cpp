@@ -543,6 +543,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
             env->ExceptionDescribe();
             env->ExceptionClear();
         }
+        return JNI_ERR;
     }
 
     // Register NativeEngineBridge
@@ -562,6 +563,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
             env->ExceptionDescribe();
             env->ExceptionClear();
         }
+        return JNI_ERR;
     }
 
     LOGI("Successfully registered JNI native methods for Commix");

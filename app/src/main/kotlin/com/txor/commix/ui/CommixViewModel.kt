@@ -847,6 +847,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onSetExifPreset(privacyMode: Boolean) {
         _uiState.update { it.withExifPreset(privacyMode) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus(if (privacyMode) "EXIF Privacy Mode: Geotags Stripped" else "EXIF: All Optical & Location Metadata Allowed")
     }
 
@@ -854,36 +855,42 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
         val next = !_uiState.value.exifLocation
         _uiState.update { it.copy(exifLocation = next) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
     }
 
     fun onToggleExifCameraInfo() {
         val next = !_uiState.value.exifCameraInfo
         _uiState.update { it.copy(exifCameraInfo = next) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
     }
 
     fun onToggleExifExposure() {
         val next = !_uiState.value.exifExposureSettings
         _uiState.update { it.copy(exifExposureSettings = next) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
     }
 
     fun onToggleExifLensInfo() {
         val next = !_uiState.value.exifLensInfo
         _uiState.update { it.copy(exifLensInfo = next) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
     }
 
     fun onToggleExifDateTime() {
         val next = !_uiState.value.exifDateTime
         _uiState.update { it.copy(exifDateTime = next) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
     }
 
     fun onToggleExifImageDesc() {
         val next = !_uiState.value.exifImageDescription
         _uiState.update { it.copy(exifImageDescription = next) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
     }
 
     fun onSetVideoCodec(codec: String) {
@@ -896,6 +903,7 @@ class CommixViewModel(application: Application) : AndroidViewModel(application) 
     fun onSetEnhanceAlgo(algo: String) {
         _uiState.update { it.copy(photoEnhanceAlgo = algo) }
         preferences.save(_uiState.value)
+        updateRepositoryParams()
         showStatus("Enhancement Model: ${algo.uppercase()}")
     }
 

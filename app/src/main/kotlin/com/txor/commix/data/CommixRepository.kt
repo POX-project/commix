@@ -1568,7 +1568,8 @@ class CommixRepository(private val context: Context) {
         val lut = currentParams.lutLook
         val enhance = currentParams.photoEnhanceAlgo
         val isNonDefaultFormat = currentParams.photoFormat.lowercase() != "jpeg" && currentParams.photoFormat.lowercase() != "jpg"
-        val needsProcessing = (curve != "neutral" || grain != "off" || (lut.isNotEmpty() && lut != "none") || enhance == "clarity" || enhance == "unsharp" || isNonDefaultFormat)
+        val isEnhanceActive = enhance in listOf("clarity", "detail", "unsharp", "super_res")
+        val needsProcessing = (curve != "neutral" || grain != "off" || (lut.isNotEmpty() && lut != "none") || isEnhanceActive || isNonDefaultFormat)
         if (!needsProcessing) return jpegBytes
         if (!NativeEngineBridge.isLoaded && !isNonDefaultFormat) return jpegBytes
 
@@ -1639,10 +1640,20 @@ class CommixRepository(private val context: Context) {
                     directBuf.rewind()
                 }
 
-                // 3. Unsharp Mask Clarity Enhancement
-                if (enhance == "clarity" || enhance == "unsharp") {
-                    NativeEngineBridge.nativeApplyUnsharpMaskDirect(directBuf, w, h, 4, 1.5f, 0.6f)
-                    directBuf.rewind()
+                // 3. Unsharp Mask Clarity / Detail / Super Resolution Enhancement
+                when (enhance) {
+                    "detail" -> {
+                        NativeEngineBridge.nativeApplyUnsharpMaskDirect(directBuf, w, h, 4, 1.0f, 0.4f)
+                        directBuf.rewind()
+                    }
+                    "clarity", "unsharp" -> {
+                        NativeEngineBridge.nativeApplyUnsharpMaskDirect(directBuf, w, h, 4, 1.5f, 0.6f)
+                        directBuf.rewind()
+                    }
+                    "super_res" -> {
+                        NativeEngineBridge.nativeApplyUnsharpMaskDirect(directBuf, w, h, 4, 2.0f, 0.8f)
+                        directBuf.rewind()
+                    }
                 }
 
                 mutableBmp.copyPixelsFromBuffer(directBuf)
