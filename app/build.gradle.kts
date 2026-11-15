@@ -7,13 +7,14 @@ plugins {
 android {
     namespace = "com.txor.commix"
     compileSdk = 35
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "com.txor.commix"
         minSdk = 28
         targetSdk = 35
-        versionCode = 15
-        versionName = "1.0.0"
+        versionCode = 16
+        versionName = "1.0.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

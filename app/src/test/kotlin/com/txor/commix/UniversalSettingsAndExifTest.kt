@@ -214,4 +214,51 @@ class UniversalSettingsAndExifTest {
         assertEquals(512, activeState.vectorscopeSamples.size)
         assertEquals(-1.0f, activeState.vectorscopeSamples[0], 0.001f)
     }
+
+    @Test
+    fun testExifIndividualTogglesUpdateExifOptions() {
+        var state = CameraUiState(
+            exifLocation = false,
+            exifCameraInfo = false,
+            exifExposureSettings = false,
+            exifLensInfo = false,
+            exifDateTime = false,
+            exifImageDescription = false
+        )
+        var opts = state.toExifOptions()
+        assertFalse(opts.location)
+        assertFalse(opts.cameraInfo)
+        assertFalse(opts.exposureSettings)
+        assertFalse(opts.lensSpecs)
+        assertFalse(opts.dateTime)
+        assertFalse(opts.imageDescription)
+
+        // Toggle each individually and assert that toExifOptions reflects each change
+        state = state.copy(exifLocation = true)
+        assertTrue(state.toExifOptions().location)
+
+        state = state.copy(exifCameraInfo = true)
+        assertTrue(state.toExifOptions().cameraInfo)
+
+        state = state.copy(exifExposureSettings = true)
+        assertTrue(state.toExifOptions().exposureSettings)
+
+        state = state.copy(exifLensInfo = true)
+        assertTrue(state.toExifOptions().lensSpecs)
+
+        state = state.copy(exifDateTime = true)
+        assertTrue(state.toExifOptions().dateTime)
+
+        state = state.copy(exifImageDescription = true)
+        assertTrue(state.toExifOptions().imageDescription)
+    }
+
+    @Test
+    fun testEnhanceAlgoOptionsCoverage() {
+        val validAlgos = listOf("clarity", "detail", "unsharp", "super_res")
+        for (algo in validAlgos) {
+            val state = CameraUiState(photoEnhanceAlgo = algo)
+            assertEquals("photoEnhanceAlgo must preserve $algo", algo, state.photoEnhanceAlgo)
+        }
+    }
 }

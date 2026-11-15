@@ -668,8 +668,42 @@ void test_onload_registration_table() {
         REQUIRE(g_engine_methods[i].fnPtr != nullptr);
     }
 
+    // Test JNI_OnLoad behavior
+    auto testGetEnv = [](void** penv, jint) -> jint {
+        static _JNIEnv envInstance;
+        *penv = &envInstance;
+        return JNI_OK;
+    };
+    JavaVM vm;
+    vm.GetEnv = testGetEnv;
+
+    // Case A: Successful load returns JNI_VERSION_1_6
+    {
+        envState().reset();
+        envState().findClassFails = false;
+        envState().registerNativesFails = false;
+        jint res = JNI_OnLoad(&vm, nullptr);
+        REQUIRE(res == JNI_VERSION_1_6);
+    }
+
+    // Case B: FindClass failure returns JNI_ERR
+    {
+        envState().reset();
+        envState().findClassFails = true;
+        jint res = JNI_OnLoad(&vm, nullptr);
+        REQUIRE(res == JNI_ERR);
+    }
+
+    // Case C: RegisterNatives failure returns JNI_ERR
+    {
+        envState().reset();
+        envState().registerNativesFails = true;
+        jint res = JNI_OnLoad(&vm, nullptr);
+        REQUIRE(res == JNI_ERR);
+    }
+
     std::cout << "  [PASS] Registration tables complete (" << telemetryCount
-              << " telemetry + " << engineCount << " engine natives)." << std::endl;
+              << " telemetry + " << engineCount << " engine natives) and JNI_OnLoad failure paths verified." << std::endl;
 }
 
 }  // namespace

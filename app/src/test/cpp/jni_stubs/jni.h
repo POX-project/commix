@@ -147,6 +147,9 @@ struct EnvState {
     int setFloatArrayRegionCalls = 0;
     int setIntArrayRegionCalls = 0;
 
+    bool findClassFails = false;
+    bool registerNativesFails = false;
+
     void reset() { *this = EnvState(); }
 };
 
@@ -309,6 +312,10 @@ struct _JNIEnv {
         commix_jni_stub::noteCall();
         commix_jni_stub::envState().findClassCalls++;
         (void)name;
+        if (commix_jni_stub::envState().findClassFails) {
+            commix_jni_stub::raiseException("java.lang.ClassNotFoundException");
+            return nullptr;
+        }
         // Any non-null handle stands in for a found class.
         static commix_jni_stub::StringObject placeholder;
         return &placeholder;
@@ -319,6 +326,10 @@ struct _JNIEnv {
         (void)methods;
         commix_jni_stub::envState().registerNativesCalls++;
         (void)count;
+        if (commix_jni_stub::envState().registerNativesFails) {
+            commix_jni_stub::raiseException("java.lang.NoSuchMethodError");
+            return -1;
+        }
         return JNI_OK;
     }
 };
